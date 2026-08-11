@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+
+# Joern workspace
+workspace/
+
+# Large artifacts
+*.bin
+*.pt
+
+# Generated datasets
+data/intermediate/
+
+# Models
+models/
+
+# Results
+results/
+
+# OS
+.DS_Store
+Thumbs.db
+
+#ToDo
+ToDo/
+
+data/intermediate
+data/processed
