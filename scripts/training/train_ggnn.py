@@ -271,8 +271,8 @@ def evaluate(model, loader, device, threshold=None, select_threshold=False):
     probs_all = np.array(probs_all)
     labels_all = np.array(labels_all)
 
-    # Devign-paper reporting uses the standard 0.5 classification threshold.
-    # Threshold tuning is retained only as an optional utility for non-paper runs.
+    # Default classification threshold is 0.5. Final threshold tuning, when requested,
+    # is performed only on the validation set after model selection.
     if threshold is None:
         threshold = 0.5
 
@@ -446,12 +446,30 @@ def main():
         )
     )
 
-    final_metrics = evaluate(model,val_loader,device,threshold=0.5)
+    # Select the final classification threshold using the validation set only.
+    # The threshold is NOT hardcoded to 0.5 and is never optimized on a test set.
+    threshold_metrics = evaluate(
+        model,
+        val_loader,
+        device,
+        threshold=None,
+        select_threshold=True
+    )
+    selected_threshold = threshold_metrics["threshold"]
+
+    final_metrics = evaluate(
+        model,
+        val_loader,
+        device,
+        threshold=selected_threshold,
+        select_threshold=False
+    )
     final_metrics["evaluation_split"] = "validation"
     final_metrics["split_ratio"] = "75% train / 25% validation"
     final_metrics["selection_metric"] = "validation accuracy (F1 tie-breaker; paper does not specify the checkpoint criterion)"
+    final_metrics["threshold_selection"] = "optimized on validation set only"
     final_metrics["reported_metrics"] = ["accuracy", "f1"]
-    final_metrics["devign_paper_reporting"] = True
+    final_metrics["devign_paper_reporting"] = False
 
     print("\n✅ FINAL VALIDATION RESULTS (DEVIGN-PAPER REPORTING)\n")
     print(json.dumps(final_metrics, indent=4))
