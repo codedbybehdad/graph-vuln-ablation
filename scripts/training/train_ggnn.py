@@ -16,8 +16,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torch.utils.data import Dataset, WeightedRandomSampler
-from torch_geometric.loader import DataLoader
-from torch_geometric.nn import RGCNConv
+from torch_geometric.loader import DataLoader, DataListLoader
+from torch_geometric.nn import RGCNConv, DataParallel as PyGDataParallel
 from torch_geometric.utils import to_dense_batch
 
 from sklearn.model_selection import StratifiedKFold
@@ -27,6 +27,9 @@ from sklearn.metrics import (
     recall_score,
     f1_score,
     roc_auc_score,
+    average_precision_score,
+    matthews_corrcoef,
+    confusion_matrix,
 )
 
 
@@ -34,16 +37,16 @@ from sklearn.metrics import (
 # Reproducibility / CUDA
 # ------------------------------------------------------------
 
-def set_seed(seed=42):
+def set_seed(seed=42, deterministic=False):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    # Determinism is important for thesis experiments.  We disable
-    # benchmark selection because graph batches have variable shapes.
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # Deterministic kernels are useful for exact reruns, but they can be
+    # materially slower on Kaggle. Keep them opt-in for high-throughput runs.
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
 
 
 def seed_worker(worker_id):
@@ -154,9 +157,11 @@ class GGNN(nn.Module):
 
     @staticmethod
     def _branch(dense_seq, valid, conv1, pool1, conv2, pool2, mlp):
-        # dense_seq: [B, N, C], valid: [B, N]. Keep each graph independent
-        # while allowing Conv1d to process the whole batch in one GPU call.
-        seq = dense_seq.transpose(1, 2)  # [B, C, N]
+        # dense_seq: [B, N, C], valid: [B, N]
+        # Keep the sequence dimension because Devign performs the pairwise
+        # multiplication between the two learned sequences before graph-level
+        # reduction.
+        seq = dense_seq.transpose(1, 2)
         seq = F.relu(conv1(seq))
 
         valid_f = valid.unsqueeze(1).to(dtype=seq.dtype)
@@ -167,36 +172,45 @@ class GGNN(nn.Module):
         valid_f = F.max_pool1d(valid_f, kernel_size=2, stride=2, padding=1)
         seq = pool2(seq)
 
-        node_scores = mlp(seq.transpose(1, 2)).squeeze(-1)
+        node_logits = mlp(seq.transpose(1, 2)).squeeze(-1)
         valid_f = valid_f.squeeze(1)
-        node_scores = node_scores * valid_f
-        denom = valid_f.sum(dim=1).clamp_min(1.0)
-        return node_scores.sum(dim=1) / denom
+        return node_logits, valid_f
 
-    def forward(self, x, edge_index, edge_type, batch):
+    def forward_tensors(self, x, edge_index, edge_type, batch):
         h = self.input_projection(x)
         for _ in range(self.num_steps):
             h = self.ggnn(h, edge_index, edge_type)
 
-        # Vectorized per-graph Conv readout. to_dense_batch preserves the
-        # original node order while isolating graphs in the batch.
         h_dense, valid = to_dense_batch(h, batch)
         x_dense, _ = to_dense_batch(x, batch)
 
-        z = self._branch(
+        z, valid_z = self._branch(
             torch.cat([h_dense, x_dense], dim=-1),
             valid,
             self.conv1_z, self.pool1_z, self.conv2_z, self.pool2_z, self.mlp_z,
         )
-        y = self._branch(
+        y, valid_y = self._branch(
             h_dense,
             valid,
             self.conv1_y, self.pool1_y, self.conv2_y, self.pool2_y, self.mlp_y,
         )
 
-        # Devign-style pairwise interaction occurs at the node/sequence level
-        # before the graph reduction. The result is a raw logit for BCEWithLogitsLoss.
-        return z * y
+        valid_nodes = (valid_z * valid_y).to(dtype=z.dtype)
+        pairwise = z * y
+        denom = valid_nodes.sum(dim=1).clamp_min(1.0)
+        graph_logits = (pairwise * valid_nodes).sum(dim=1) / denom
+
+        # Devign's published implementation applies the sigmoid after the
+        # sequence-level pairwise reduction. Returning probabilities here keeps
+        # the training/evaluation path faithful to that formulation.
+        return torch.sigmoid(graph_logits)
+
+    def forward(self, x, edge_index=None, edge_type=None, batch=None):
+        # PyG DataParallel calls the wrapped module with a Data/Batch object.
+        if hasattr(x, "x") and hasattr(x, "edge_index"):
+            data = x
+            return self.forward_tensors(data.x, data.edge_index, data.edge_type, data.batch)
+        return self.forward_tensors(x, edge_index, edge_type, batch)
 
 
 # ------------------------------------------------------------
@@ -218,44 +232,55 @@ def best_threshold_for_f1(probs, labels):
     return best_threshold
 
 
-def evaluate(model, loader, device, threshold=None, select_threshold=False):
+def evaluate(model, loader, device, threshold=None, select_threshold=False, multi_gpu=False):
     model.eval()
 
     probs_all = []
     labels_all = []
-    logits_all = []
 
     with torch.inference_mode():
         for data in loader:
-            data = data.to(device, non_blocking=True)
-            logits = model(data.x, data.edge_index, data.edge_type, data.batch)
-            probs = torch.sigmoid(logits)
-
-            probs_all.extend(probs.detach().cpu().numpy())
-            labels_all.extend(data.y.detach().cpu().numpy())
-            logits_all.extend(logits.detach().cpu().numpy())
+            if multi_gpu:
+                labels = torch.cat([d.y.view(-1).long() for d in data], dim=0)
+                probs = model(data)
+                labels_all.extend(labels.cpu().numpy())
+                probs_all.extend(probs.detach().cpu().numpy())
+            else:
+                data = data.to(device, non_blocking=True)
+                probs = model(data.x, data.edge_index, data.edge_type, data.batch)
+                probs_all.extend(probs.detach().cpu().numpy())
+                labels_all.extend(data.y.detach().view(-1).cpu().numpy())
 
     probs_all = np.asarray(probs_all, dtype=np.float64)
     labels_all = np.asarray(labels_all, dtype=np.int64)
 
     if threshold is None:
         threshold = 0.5
-
     if select_threshold:
         threshold = best_threshold_for_f1(probs_all, labels_all)
 
     preds = (probs_all >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(labels_all, preds, labels=[0, 1]).ravel()
 
     auc = 0.5 if len(np.unique(labels_all)) < 2 else roc_auc_score(labels_all, probs_all)
+    pr_auc = 0.5 if len(np.unique(labels_all)) < 2 else average_precision_score(labels_all, probs_all)
+    mcc = matthews_corrcoef(labels_all, preds) if len(np.unique(labels_all)) > 1 else 0.0
+    specificity = float(tn / (tn + fp)) if (tn + fp) else 0.0
 
     return {
-        "accuracy": accuracy_score(labels_all, preds),
-        "precision": precision_score(labels_all, preds, zero_division=0),
-        "recall": recall_score(labels_all, preds, zero_division=0),
-        "f1": f1_score(labels_all, preds, zero_division=0),
-        "auc": auc,
+        "accuracy": float(accuracy_score(labels_all, preds)),
+        "precision": float(precision_score(labels_all, preds, zero_division=0)),
+        "recall": float(recall_score(labels_all, preds, zero_division=0)),
+        "specificity": specificity,
+        "f1": float(f1_score(labels_all, preds, zero_division=0)),
+        "auc": float(auc),
+        "pr_auc": float(pr_auc),
+        "mcc": float(mcc),
+        "true_positive": int(tp),
+        "false_positive": int(fp),
+        "true_negative": int(tn),
+        "false_negative": int(fn),
         "threshold": float(threshold),
-        "logit_mean": float(np.mean(logits_all)),
         "prob_mean": float(np.mean(probs_all)),
         "prob_std": float(np.std(probs_all)),
     }
@@ -265,22 +290,30 @@ def evaluate(model, loader, device, threshold=None, select_threshold=False):
 # Training
 # ------------------------------------------------------------
 
-def train_epoch(model, loader, optimizer, criterion, device, scaler, amp_enabled, grad_clip):
+def train_epoch(model, loader, optimizer, criterion, device, scaler, amp_enabled, grad_clip, multi_gpu=False):
     model.train()
     total_loss = 0.0
 
     for data in loader:
-        data = data.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
+
+        if multi_gpu:
+            labels = torch.cat([d.y.float().view(-1) for d in data], dim=0)
+        else:
+            data = data.to(device, non_blocking=True)
+            labels = data.y.float().view(-1)
 
         with torch.autocast(
             device_type="cuda" if device.type == "cuda" else "cpu",
             dtype=torch.float16,
             enabled=amp_enabled,
         ):
-            logits = model(data.x, data.edge_index, data.edge_type, data.batch)
-            labels = data.y.float().view(-1)
-            loss = criterion(logits, labels)
+            if multi_gpu:
+                probs = model(data)
+                loss = criterion(probs.clamp(1e-6, 1 - 1e-6), labels.to(probs.device))
+            else:
+                probs = model(data.x, data.edge_index, data.edge_type, data.batch)
+                loss = criterion(probs.clamp(1e-6, 1 - 1e-6), labels)
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -308,7 +341,7 @@ def build_sampler(items):
     return WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
 
 
-def make_loader(dataset, batch_size, train, workers, pin_memory, seed):
+def make_loader(dataset, batch_size, train, workers, pin_memory, seed, multi_gpu=False):
     generator = torch.Generator()
     generator.manual_seed(seed)
 
@@ -328,37 +361,44 @@ def make_loader(dataset, batch_size, train, workers, pin_memory, seed):
         # Kaggle uses Linux; fork lets workers share the read-only RAM cache
         # without serializing every cached graph into each worker.
         kwargs["multiprocessing_context"] = "fork"
-    return DataLoader(**kwargs)
+    loader_cls = DataListLoader if multi_gpu else DataLoader
+    # DataListLoader is required by PyG DataParallel because it splits whole
+    # graph objects, then builds a Batch independently on each GPU.
+    return loader_cls(**kwargs)
 
 
-def train_fold(args, train_items, val_items, fold_id, device, graph_cache):
+def train_fold(args, train_items, val_items, fold_id, device, graph_cache, multi_gpu=False):
     fold_seed = args.seed + fold_id
-    set_seed(fold_seed)
+    set_seed(fold_seed, args.deterministic)
 
     train_dataset = GraphDataset(train_items, edge_mode=args.edges, graph_cache=graph_cache)
     val_dataset = GraphDataset(val_items, edge_mode=args.edges, graph_cache=graph_cache)
 
     pin_memory = device.type == "cuda"
     train_loader = make_loader(
-        train_dataset, args.batch_size, True, args.workers, pin_memory, fold_seed
+        train_dataset, args.batch_size, True, args.workers, pin_memory, fold_seed, multi_gpu=multi_gpu
     )
     val_loader = make_loader(
-        val_dataset, args.batch_size, False, args.workers, pin_memory, fold_seed
+        val_dataset, args.batch_size, False, args.workers, pin_memory, fold_seed, multi_gpu=multi_gpu
     )
 
     sample = train_dataset[0]
     in_channels = int(sample.x.shape[1])
 
-    model = GGNN(
+    base_model = GGNN(
         in_channels=in_channels,
         hidden_dim=args.hidden_dim,
         num_steps=args.steps,
         num_relations=3,
     ).to(device)
 
-    # The weighted sampler already balances classes, so avoid double
-    # reweighting the positive class in BCE.
-    criterion = nn.BCEWithLogitsLoss()
+    model = base_model
+    if multi_gpu:
+        model = PyGDataParallel(base_model, device_ids=list(range(torch.cuda.device_count())))
+
+    # Devign-style readout returns probabilities, so use BCE on probabilities.
+    # The weighted sampler balances classes without double-weighting the loss.
+    criterion = nn.BCELoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -388,10 +428,11 @@ def train_fold(args, train_items, val_items, fold_id, device, graph_cache):
             scaler,
             amp_enabled,
             args.grad_clip,
+            multi_gpu=multi_gpu,
         )
 
         val_metrics = evaluate(
-            model, val_loader, device, select_threshold=True
+            model, val_loader, device, select_threshold=True, multi_gpu=multi_gpu
         )
         scheduler.step(val_metrics["f1"])
 
@@ -416,7 +457,7 @@ def train_fold(args, train_items, val_items, fold_id, device, graph_cache):
                 "monitor": monitor,
                 "epoch": epoch + 1,
                 "metrics": deepcopy(val_metrics),
-                "state_dict": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+                "state_dict": {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()},
             }
             epochs_without_improvement = 0
         else:
@@ -425,13 +466,14 @@ def train_fold(args, train_items, val_items, fold_id, device, graph_cache):
                 print(f"Fold {fold_id} | early stopping at epoch {epoch + 1}")
                 break
 
-    model.load_state_dict(best["state_dict"])
+    base_model.load_state_dict(best["state_dict"])
     final_metrics = evaluate(
         model,
         val_loader,
         device,
         threshold=best["metrics"]["threshold"],
         select_threshold=False,
+        multi_gpu=multi_gpu,
     )
 
     model_path = os.path.join(
@@ -439,7 +481,7 @@ def train_fold(args, train_items, val_items, fold_id, device, graph_cache):
     )
     torch.save(
         {
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": base_model.state_dict(),
             "in_channels": in_channels,
             "hidden_dim": args.hidden_dim,
             "steps": args.steps,
@@ -462,7 +504,7 @@ def train_fold(args, train_items, val_items, fold_id, device, graph_cache):
 
 
 def aggregate_fold_metrics(fold_results):
-    metric_names = ["accuracy", "precision", "recall", "f1", "auc"]
+    metric_names = ["accuracy", "precision", "recall", "specificity", "f1", "auc", "pr_auc", "mcc"]
     aggregate = {}
     for name in metric_names:
         values = np.asarray([r["metrics"][name] for r in fold_results], dtype=np.float64)
@@ -488,6 +530,7 @@ def main():
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--model_dir", type=str, default="models")
     parser.add_argument("--results_dir", type=str, default="results")
@@ -496,15 +539,18 @@ def main():
     if args.folds < 2:
         raise ValueError("--folds must be at least 2")
 
-    set_seed(args.seed)
+    set_seed(args.seed, args.deterministic)
     torch.set_float32_matmul_precision("high")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    multi_gpu = bool(device.type == "cuda" and torch.cuda.device_count() > 1)
     print("\n🚀 Device:", device)
     if device.type == "cuda":
-        print("🎮 GPU:", torch.cuda.get_device_name(0))
-        print("💾 VRAM (GiB):", round(torch.cuda.get_device_properties(0).total_memory / 2**30, 2))
+        print("🎮 GPUs:", torch.cuda.device_count())
+        for gpu_id in range(torch.cuda.device_count()):
+            print(f"   GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)} | VRAM (GiB): {torch.cuda.get_device_properties(gpu_id).total_memory / 2**30:.2f}")
         print("⚡ AMP:", not args.no_amp)
+        print("⚡ Multi-GPU:", multi_gpu)
 
     dataset_index_path = f"data/processed/{args.dataset}_dataset_index.pt"
     if not os.path.exists(dataset_index_path):
@@ -544,11 +590,13 @@ def main():
         print(f"FOLD {fold_id}/{args.folds}: train={len(train_items)} val={len(val_items)}")
         print("=" * 72)
 
-        result = train_fold(args, train_items, val_items, fold_id, device, graph_cache)
+        result = train_fold(args, train_items, val_items, fold_id, device, graph_cache, multi_gpu=multi_gpu)
         all_fold_results.append(result)
         if device.type == "cuda":
-            peak_gib = torch.cuda.max_memory_allocated(device) / (2 ** 30)
-            print(f"Fold {fold_id} peak VRAM allocated: {peak_gib:.2f} GiB")
+            peak_gib = [torch.cuda.max_memory_allocated(gpu_id) / (2 ** 30) for gpu_id in range(torch.cuda.device_count())]
+            print("Fold {} peak VRAM allocated: {}".format(
+                fold_id, ", ".join(f"GPU {i}={v:.2f} GiB" for i, v in enumerate(peak_gib))
+            ))
         print(f"Fold {fold_id} result: {json.dumps(result['metrics'], indent=2)}")
 
     aggregate = aggregate_fold_metrics(all_fold_results)
@@ -570,6 +618,8 @@ def main():
             "grad_clip": args.grad_clip,
             "amp": not args.no_amp,
             "workers": args.workers,
+            "deterministic": args.deterministic,
+            "gpu_count": torch.cuda.device_count() if device.type == "cuda" else 0,
         },
         "folds_results": all_fold_results,
         "aggregate": aggregate,
@@ -578,7 +628,7 @@ def main():
     safe_edges = args.edges.replace("+", "_")
     result_path = os.path.join(
         args.results_dir,
-        f"cv5_{args.dataset}_{safe_edges}.json",
+        f"cv{args.folds}_{args.dataset}_{safe_edges}.json",
     )
     os.makedirs(args.results_dir, exist_ok=True)
     with open(result_path, "w", encoding="utf-8") as f:

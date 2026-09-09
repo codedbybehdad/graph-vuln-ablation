@@ -822,3 +822,29 @@ The training script supports a reporting configuration based on the settings exp
 The paper does not specify the exact metric used internally to choose an early-stopping checkpoint. This implementation uses validation Accuracy, with F1 as a tie-breaker, and records that choice explicitly in the results JSON. It does **not** present a separate test-set result for this reporting mode, because the main paper results are described as a 75% training / 25% validation evaluation.
 
 The reported Accuracy/F1 should therefore be compared with the paper's Accuracy/F1 table only as a reporting-protocol comparison; the architecture and preprocessing in this thesis implementation are not identical to the original Devign implementation.
+
+
+## Kaggle GPU training notes
+
+The training script automatically detects all visible CUDA GPUs. When two GPUs are available, it uses PyG's graph-aware `DataParallel` so each GPU receives whole graphs rather than splitting graph tensors incorrectly. The loader therefore uses `DataListLoader` for multi-GPU runs. PyG recommends DistributedDataParallel for maximum scalability, but this repository uses graph-aware DataParallel to keep the single-process CLI and K-fold experiment workflow simple. (PyG DataParallel documentation: https://pytorch-geometric.readthedocs.io/en/latest/modules/nn.html)
+
+For a two-GPU Kaggle runtime, a practical full-experiment command is:
+
+```bash
+python main.py \
+  --full-experiment \
+  --folds 5 \
+  --epochs 60 \
+  --batch-size 256 \
+  --hidden-dim 200 \
+  --steps 6 \
+  --workers 4
+```
+
+If 256 causes an out-of-memory error on the available GPUs, use 128. The script prints the detected GPU count and reports peak allocated VRAM separately for every GPU after each fold.
+
+The JSON files saved under `results/` contain fold-level and aggregate metrics including accuracy, precision, recall, specificity, F1, ROC-AUC, PR-AUC, MCC, confusion-matrix counts, decision threshold, and prediction statistics.
+
+### Training correctness sanity check
+
+Before spending hours on the complete 5-fold experiment, verify that the model is learning rather than staying at the BCE chance level of about 0.693. A healthy run should show the training loss move away from that initial plateau and validation AUC/F1 should not remain identical across epochs.
