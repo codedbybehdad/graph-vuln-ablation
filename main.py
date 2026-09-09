@@ -40,7 +40,7 @@ def resolve_python_executable():
         candidates.append(env_python)
 
     candidates.extend([
-        PYTHON_EXECUTABLE,
+        sys.executable,
         shutil.which("python") or "",
         shutil.which("python3") or "",
         "/opt/conda/bin/python",
