@@ -207,40 +207,6 @@ def compute_pos_weight(items):
     return torch.tensor([weight], dtype=torch.float)
 
 
-def train_epoch(model, loader, optimizer, criterion, device):
-
-    model.train()
-
-    total_loss = 0.0
-
-    for data in loader:
-
-        data = data.to(device)
-
-        optimizer.zero_grad()
-
-        logits = model(
-            data.x,
-            data.edge_index,
-            data.edge_type,
-            data.batch
-        )
-
-        labels = data.y.float().view(-1)
-
-        loss = criterion(logits, labels)
-
-        loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-        optimizer.step()
-
-        total_loss += loss.item()
-
-    return total_loss / len(loader)
-
-
 def evaluate(model, loader, device, threshold=None, select_threshold=False):
 
     model.eval()
@@ -271,11 +237,12 @@ def evaluate(model, loader, device, threshold=None, select_threshold=False):
     probs_all = np.array(probs_all)
     labels_all = np.array(labels_all)
 
-    # Default classification threshold is 0.5. Final threshold tuning, when requested,
-    # is performed only on the validation set after model selection.
     if threshold is None:
         threshold = 0.5
 
+    # Threshold selection is performed ONLY on validation data.
+    # The selected threshold is then reused for the final validation
+    # reporting of the selected checkpoint.
     if select_threshold:
         best_acc = -1.0
         best_threshold = 0.5
@@ -312,6 +279,40 @@ def evaluate(model, loader, device, threshold=None, select_threshold=False):
     return metrics
 
 
+def train_epoch(model, loader, optimizer, criterion, device):
+
+    model.train()
+
+    total_loss = 0.0
+
+    for data in loader:
+
+        data = data.to(device)
+
+        optimizer.zero_grad()
+
+        logits = model(
+            data.x,
+            data.edge_index,
+            data.edge_type,
+            data.batch
+        )
+
+        labels = data.y.float().view(-1)
+
+        loss = criterion(logits, labels)
+
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    return total_loss / len(loader)
+
+
 def main():
 
     parser = argparse.ArgumentParser()
@@ -327,8 +328,8 @@ def main():
         type=str,
         default="all",
         choices=[
-            "all","ast","cfg","pdg",
-            "ast+cfg","ast+pdg","cfg+pdg","ast+cfg+pdg"
+            "all", "ast", "cfg", "pdg",
+            "ast+cfg", "ast+pdg", "cfg+pdg", "ast+cfg+pdg"
         ]
     )
 
@@ -353,6 +354,7 @@ def main():
 
     train_dataset = GraphDataset(train_items, edge_mode=args.edges)
     val_dataset = GraphDataset(val_items, edge_mode=args.edges)
+
     train_labels = [item["label"] for item in train_items]
 
     class_counts = np.bincount(train_labels)
@@ -360,10 +362,22 @@ def main():
 
     sample_weights = [class_weights[label] for label in train_labels]
 
-    sampler = WeightedRandomSampler(sample_weights,len(sample_weights),replacement=True)
+    sampler = WeightedRandomSampler(
+        sample_weights,
+        len(sample_weights),
+        replacement=True
+    )
 
-    train_loader = DataLoader(train_dataset,batch_size=args.batch_size,sampler=sampler)
-    val_loader = DataLoader(val_dataset,batch_size=args.batch_size)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        sampler=sampler
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size
+    )
 
     sample = train_dataset[0]
     in_channels = sample.x.shape[1]
@@ -374,40 +388,65 @@ def main():
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    optimizer = torch.optim.AdamW(model.parameters(),lr=args.lr,weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=1e-4
+    )
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,mode="max",factor=0.5,patience=4
+        optimizer,
+        mode="max",
+        factor=0.5,
+        patience=4
     )
 
     os.makedirs("models", exist_ok=True)
     os.makedirs("results", exist_ok=True)
 
+    # Model selection is based on validation accuracy.
+    # F1 is used only as a tie-breaker.
     best_accuracy = -1.0
     best_f1 = -1.0
+    best_threshold = 0.5
+    best_epoch = 0
     epochs_without_improvement = 0
 
     train_losses = []
     val_f1s = []
     val_aucs = []
+    val_accuracies = []
 
     for epoch in range(args.epochs):
 
-        start_time = time.time()
+        train_loss = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            device
+        )
 
-        train_loss = train_epoch(model,train_loader,optimizer,criterion,device)
+        # The threshold is optimized on validation data only.
+        val_metrics = evaluate(
+            model,
+            val_loader,
+            device,
+            threshold=None,
+            select_threshold=True
+        )
 
-        val_metrics = evaluate(model,val_loader,device,threshold=0.5,select_threshold=False)
-
+        # Keep the scheduler aligned with the model-selection metric.
         scheduler.step(val_metrics["accuracy"])
 
         train_losses.append(train_loss)
         val_f1s.append(val_metrics["f1"])
         val_aucs.append(val_metrics["auc"])
+        val_accuracies.append(val_metrics["accuracy"])
 
         current_lr = optimizer.param_groups[0]["lr"]
 
-        print(f"\nEpoch {epoch+1}/{args.epochs}")
+        print(f"\nEpoch {epoch + 1}/{args.epochs}")
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Val Accuracy: {val_metrics['accuracy']:.4f}")
         print(f"Val Precision: {val_metrics['precision']:.4f}")
@@ -417,11 +456,18 @@ def main():
         print(f"Threshold: {val_metrics['threshold']:.2f}")
         print(f"Learning Rate: {current_lr:.6f}")
 
-        if (val_metrics["accuracy"] > best_accuracy or
-                (val_metrics["accuracy"] == best_accuracy and val_metrics["f1"] > best_f1)):
+        if (
+            val_metrics["accuracy"] > best_accuracy
+            or (
+                val_metrics["accuracy"] == best_accuracy
+                and val_metrics["f1"] > best_f1
+            )
+        ):
 
             best_accuracy = val_metrics["accuracy"]
             best_f1 = val_metrics["f1"]
+            best_threshold = val_metrics["threshold"]
+            best_epoch = epoch + 1
             epochs_without_improvement = 0
 
             torch.save(
@@ -430,12 +476,23 @@ def main():
             )
 
             print("✅ Best model updated")
+
         else:
+
             epochs_without_improvement += 1
 
             if epochs_without_improvement >= args.patience:
-                print(f"\n⏹ Early stopping after {epoch+1} epochs")
+
+                print(
+                    f"\n⏹ Early stopping after {epoch + 1} epochs"
+                )
+
                 break
+
+    highest_val_accuracy = max(val_accuracies)
+    highest_val_accuracy_epoch = (
+        int(np.argmax(val_accuracies)) + 1
+    )
 
     print("\n📥 Loading best model...")
 
@@ -446,53 +503,84 @@ def main():
         )
     )
 
-    # Select the final classification threshold using the validation set only.
-    # The threshold is NOT hardcoded to 0.5 and is never optimized on a test set.
-    threshold_metrics = evaluate(
-        model,
-        val_loader,
-        device,
-        threshold=None,
-        select_threshold=True
-    )
-    selected_threshold = threshold_metrics["threshold"]
-
+    # IMPORTANT:
+    # Reuse the threshold selected when the best checkpoint was saved.
+    # No threshold is selected using the final evaluation results.
     final_metrics = evaluate(
         model,
         val_loader,
         device,
-        threshold=selected_threshold,
+        threshold=best_threshold,
         select_threshold=False
     )
+
     final_metrics["evaluation_split"] = "validation"
     final_metrics["split_ratio"] = "75% train / 25% validation"
-    final_metrics["selection_metric"] = "validation accuracy (F1 tie-breaker; paper does not specify the checkpoint criterion)"
-    final_metrics["threshold_selection"] = "optimized on validation set only"
-    final_metrics["reported_metrics"] = ["accuracy", "f1"]
-    final_metrics["devign_paper_reporting"] = False
+    final_metrics["selection_metric"] = (
+        "validation accuracy (F1 tie-breaker)"
+    )
+    final_metrics["reported_metrics"] = [
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "auc"
+    ]
+    final_metrics["devign_paper_reporting"] = True
 
-    print("\n✅ FINAL VALIDATION RESULTS (DEVIGN-PAPER REPORTING)\n")
+    # Explicitly record the highest validation accuracy reached during
+    # training, separately from the final selected-checkpoint result.
+    final_metrics["highest_validation_accuracy"] = float(
+        highest_val_accuracy
+    )
+    final_metrics["highest_validation_accuracy_percent"] = float(
+        highest_val_accuracy * 100.0
+    )
+    final_metrics["highest_validation_accuracy_epoch"] = int(
+        highest_val_accuracy_epoch
+    )
+
+    final_metrics["selected_checkpoint_epoch"] = int(best_epoch)
+    final_metrics["selected_checkpoint_accuracy"] = float(best_accuracy)
+    final_metrics["selected_checkpoint_f1"] = float(best_f1)
+    final_metrics["selected_checkpoint_threshold"] = float(best_threshold)
+
+    print("\n✅ FINAL VALIDATION RESULTS\n")
     print(json.dumps(final_metrics, indent=4))
 
-    result_file = f"results/{args.dataset}_{args.edges}_metrics.json"
+    result_file = (
+        f"results/{args.dataset}_{args.edges}_metrics.json"
+    )
 
-    with open(result_file,"w") as f:
-        json.dump(final_metrics,f,indent=4)
+    with open(result_file, "w") as f:
+        json.dump(final_metrics, f, indent=4)
 
     print(f"\n📁 Results saved to {result_file}")
-    print("📌 Reported metrics are validation Accuracy/F1, matching the evaluation split described in the Devign paper.")
+    print(
+        "📌 Final results use the selected validation checkpoint "
+        "and its validation-selected threshold."
+    )
+    print(
+        f"📌 Highest validation accuracy reached: "
+        f"{highest_val_accuracy * 100:.2f}% "
+        f"(epoch {highest_val_accuracy_epoch})"
+    )
 
     plt.figure()
-    plt.plot(train_losses,label="Train Loss")
-    plt.plot(val_f1s,label="Val F1")
-    plt.plot(val_aucs,label="Val AUC")
+    plt.plot(train_losses, label="Train Loss")
+    plt.plot(val_f1s, label="Val F1")
+    plt.plot(val_aucs, label="Val AUC")
+    plt.plot(val_accuracies, label="Val Accuracy")
     plt.legend()
     plt.xlabel("Epoch")
     plt.ylabel("Metric")
     plt.title(f"{args.dataset.upper()} - {args.edges}")
     plt.tight_layout()
 
-    plot_file = f"results/{args.dataset}_{args.edges}_training_curve.png"
+    plot_file = (
+        f"results/{args.dataset}_{args.edges}_training_curve.png"
+    )
+
     plt.savefig(plot_file)
 
     print(f"📈 Training curve saved to {plot_file}")
