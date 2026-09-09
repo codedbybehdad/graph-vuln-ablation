@@ -112,7 +112,7 @@ The experiments evaluate seven graph configurations:
 | `CFG + PDG`       | Control Flow + Program Dependence    |
 | `AST + CFG + PDG` | Combination of all three graph types |
 
-The training code explicitly supports all seven configurations.
+The training code explicitly supports all seven configurations. The dataset builder now combines the separate Joern PDG export with the AST/CFG export, so `PDG`, `AST+PDG`, `CFG+PDG`, and `AST+CFG+PDG` use real PDG edges rather than silently ignoring the PDG export.
 
 These configurations allow the experiment to compare the contribution of different types of structural and semantic program information to vulnerability detection.
 
@@ -190,16 +190,8 @@ Input Node Features
 Linear Node Encoder
         │
         ▼
-GGNN Layer 1
-        │
-        ▼
-Residual Connection
-        │
-        ▼
-GGNN Layer 2
-        │
-        ▼
-Residual Connection
+Relation-aware GGNN update × 6
+(AST / CFG / PDG edge-specific transforms)
         │
         ▼
 Attention-based Graph Pooling
@@ -211,13 +203,7 @@ MLP Classifier
 Vulnerability Probability
 ```
 
-The classifier consists of fully connected layers with dimensions:
-
-```text
-128 → 64 → 32 → 1
-```
-
-with ReLU activations and dropout. The GGNN uses two gated graph convolution blocks.
+The default hidden dimension is **200** and the graph state is updated for **6 propagation steps**. Edge types are explicitly used during message passing, so AST, CFG, and PDG relations are not collapsed into one undifferentiated adjacency matrix.
 
 ---
 
@@ -228,18 +214,22 @@ The default training configuration is:
 | Parameter          |             Value |
 | ------------------ | ----------------: |
 | Epochs             |                60 |
-| Batch size         |                16 |
+| Batch size         |               128 |
 | Optimizer          |             AdamW |
-| Learning rate      |          5 × 10⁻⁴ |
-| Weight decay       |          1 × 10⁻⁴ |
+| Learning rate      |          1 × 10⁻⁴ |
+| Weight decay       |        1.3 × 10⁻⁶ |
 | LR scheduler       | ReduceLROnPlateau |
 | Scheduler factor   |               0.5 |
 | Scheduler patience |                 4 |
 | Random seed        |                42 |
+| Cross-validation   |          5-fold stratified |
+| Mixed precision    |             CUDA AMP |
+| GGNN hidden dim    |                200 |
+| GGNN steps         |                  6 |
 
-The implementation also uses a `WeightedRandomSampler` during training and `BCEWithLogitsLoss` with a positive-class weight to address class imbalance.
+The implementation uses a `WeightedRandomSampler` during training so each fold sees approximately balanced class sampling; the loss itself is not additionally positive-weighted, avoiding double class reweighting.
 
-The best model is selected according to validation AUC and saved under the `models/` directory. Final test metrics are written to the `results/` directory.
+For each fold, the checkpoint is selected by validation F1 (AUC and accuracy are tie-breakers), the classification threshold is selected on that fold's validation partition, and the final reported score is the fixed-threshold score of the selected checkpoint. Results are aggregated as mean ± standard deviation across the 5 folds and saved under `results/`.
 
 ---
 
@@ -253,7 +243,7 @@ The trained models are evaluated using:
 * **F1-Score**
 * **ROC-AUC**
 
-The classification threshold is selected on the validation set by evaluating multiple thresholds and choosing the threshold that provides the highest validation accuracy. The selected validation threshold is then fixed for final test evaluation.
+The classification threshold is selected separately on each validation fold by evaluating multiple thresholds and choosing the threshold that provides the highest validation F1. That fold-specific threshold is then fixed when reporting the fold result.
 
 ---
 
@@ -304,6 +294,146 @@ The main repository structure is:
 The repository contains separate preprocessing, training, experiment, and utility directories, while intermediate and processed graph data are stored under `data/`.
 
 ---
+
+## Kaggle GPU setup
+
+The project is designed to run on a Kaggle GPU with approximately **14 GiB of VRAM**. CUDA is detected automatically and CUDA AMP is enabled by default. The training script also reports the GPU name, total VRAM, and peak VRAM allocated for each fold.
+
+### 1. Create the Kaggle notebook
+
+In Kaggle:
+
+1. Create a new **Notebook**.
+2. In **Settings**, set the accelerator to a **GPU**.
+3. Upload this repository ZIP as a Kaggle Dataset, or upload/unzip it into the notebook working directory.
+4. Make sure the repository root contains `main.py`, `scripts/`, `joern/`, and `data/`.
+
+A typical Kaggle working directory is:
+
+```text
+/kaggle/working/graph-vuln-ablation-main-kfold-kaggle/
+```
+
+Then change into that directory:
+
+```bash
+cd /kaggle/working/graph-vuln-ablation-main-kfold-kaggle
+```
+
+### 2. Install Python dependencies
+
+Run:
+
+```bash
+pip install -r requirements-kaggle.txt
+```
+
+The repository does **not** include the Joern binaries in the ZIP. You therefore need either to add a Kaggle Dataset containing a Joern installation under `joern/joern-cli/`, or point the code to an existing installation with `JOERN_HOME`. For example:
+
+```bash
+export JOERN_HOME=/kaggle/input/your-joern-dataset/joern-cli
+```
+
+The installation must provide executable `joern`, `joern-parse`, and `joern-export` files.
+
+### 3. Add the Devign dataset
+
+Place the Devign `dataset.json` at:
+
+```text
+data/raw/dataset.json
+```
+
+The Kaggle notebook can obtain this file either from an attached Kaggle Dataset or by downloading the dataset before running the pipeline. The code expects exactly this relative path.
+
+### 4. Run a small validation experiment first
+
+Before starting the complete 2-dataset × 7-configuration experiment, verify the environment with one configuration:
+
+```bash
+python main.py --dataset qemu --edge-types AST --folds 5 --epochs 60 --batch-size 128 --hidden-dim 200 --steps 6 --workers 4
+```
+
+This checks CUDA, Joern, preprocessing, graph loading, the GGNN, and 5-fold training without committing to the full experiment.
+
+### 5. Run the complete experiment
+
+After the smoke test succeeds:
+
+```bash
+python main.py \
+  --full-experiment \
+  --folds 5 \
+  --epochs 60 \
+  --batch-size 128 \
+  --hidden-dim 200 \
+  --steps 6 \
+  --workers 4
+```
+
+This runs both **QEMU** and **FFmpeg** and evaluates all seven graph configurations:
+
+```text
+AST
+CFG
+PDG
+AST + CFG
+AST + PDG
+CFG + PDG
+AST + CFG + PDG
+```
+
+### 6. VRAM tuning for Kaggle
+
+`--batch-size` is the main control for GPU memory usage. Start with `128`, then use the peak-VRAM value printed after each fold:
+
+```text
+Fold 1 peak VRAM allocated: ... GiB
+```
+
+If the run runs out of memory, reduce the batch size:
+
+```bash
+--batch-size 96
+```
+
+or:
+
+```bash
+--batch-size 64
+```
+
+If substantial VRAM remains unused and the run is stable, increase it (for example to `160` or `192`). The goal is **high utilization without out-of-memory errors**; PyTorch does not need to reserve all 14 GiB for every workload. AMP is enabled automatically on CUDA unless `--no-amp` is supplied.
+
+### 7. Important Kaggle note about preprocessing
+
+The complete pipeline is compute-heavy because Joern graph extraction is performed before training. The generated intermediate and processed files are stored inside the repository tree and can be reused in the same notebook session. Word2Vec models are cached separately for QEMU and FFmpeg.
+
+For repeated model experiments, it is therefore faster to keep:
+
+```text
+data/intermediate/
+data/processed/
+models/
+```
+
+and rerun only the training commands.
+
+### Recommended Kaggle training settings
+
+| Parameter | Recommended value |
+| --- | ---: |
+| GPU | Kaggle GPU (~14 GiB VRAM) |
+| Folds | 5 |
+| Epochs | 60 |
+| Batch size | 128 (tune using peak VRAM) |
+| Hidden dimension | 200 |
+| GGNN steps | 6 |
+| Learning rate | 1 × 10⁻⁴ |
+| Weight decay | 1.3 × 10⁻⁶ |
+| AMP | Enabled |
+| Workers | 4 |
+| Seed | 42 |
 
 ## Installation
 
@@ -459,6 +589,8 @@ The graph-building stage loads the Word2Vec model, parses graph nodes and edge t
 ---
 
 ## Training the GGNN
+
+The training script performs **stratified k-fold cross-validation**. With the default `--folds 5`, the dataset is split into five stratified folds; each fold has its own model checkpoint, validation threshold, and metrics. The final result is reported as mean ± standard deviation across folds.
 
 A single graph configuration can be trained using:
 

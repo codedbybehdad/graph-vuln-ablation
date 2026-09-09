@@ -1,0 +1,10 @@
+# Minimal project dependencies for Kaggle training.
+# Kaggle already provides CUDA-enabled PyTorch on GPU runtimes; keep
+# torch/torch-geometric unpinned so they can match the active runtime.
+numpy
+pandas
+gensim
+scikit-learn
+matplotlib
+torch
+torch-geometric

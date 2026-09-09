@@ -170,7 +170,7 @@ def build_dataset(dataset):
     run_command(cmd)
 
 
-def train_model(dataset, edge_types="AST,CFG"):
+def train_model(dataset, edge_types="AST,CFG", folds=5, epochs=60, batch_size=64, hidden_dim=200, steps=6, workers=4, seed=42, amp=True):
 
     if isinstance(edge_types, list):
         edge_types = ",".join(edge_types)
@@ -182,11 +182,18 @@ def train_model(dataset, edge_types="AST,CFG"):
     cmd = [
         sys.executable,
         os.path.join(BASE_DIR, "scripts/training/train_ggnn.py"),
-        "--dataset",
-        dataset,
-        "--edges",
-        edges_arg,
+        "--dataset", dataset,
+        "--edges", edges_arg,
+        "--folds", str(folds),
+        "--epochs", str(epochs),
+        "--batch_size", str(batch_size),
+        "--hidden_dim", str(hidden_dim),
+        "--steps", str(steps),
+        "--workers", str(workers),
+        "--seed", str(seed),
     ]
+    if not amp:
+        cmd.append("--no_amp")
 
     run_command(cmd)
 
@@ -254,7 +261,7 @@ def parse_edge_combinations(edge_input):
     return [normalize_edge_combo(edge_input)]
 
 
-def run_pipeline(dataset, edge_combinations=None):
+def run_pipeline(dataset, edge_combinations=None, folds=5, epochs=60, batch_size=64, hidden_dim=200, steps=6, workers=4, seed=42, amp=True):
 
     if edge_combinations is None:
         edge_combinations = ["AST,CFG"]
@@ -273,19 +280,19 @@ def run_pipeline(dataset, edge_combinations=None):
 
     for edges in edge_combinations:
         print(f"\n--- Training for edge combination: {edges} ---")
-        train_model(dataset, edges)
+        train_model(dataset, edges, folds=folds, epochs=epochs, batch_size=batch_size, hidden_dim=hidden_dim, steps=steps, workers=workers, seed=seed, amp=amp)
 
     print(f"\n✅ Pipeline finished for {dataset.upper()}.")
 
 
-def run_full_experiment():
+def run_full_experiment(folds=5, epochs=60, batch_size=64, hidden_dim=200, steps=6, workers=4, seed=42, amp=True):
 
     datasets = ["qemu", "ffmpeg"]
 
     combos = get_all_edge_combinations()
 
     for dataset in datasets:
-        run_pipeline(dataset, combos)
+        run_pipeline(dataset, combos, folds=folds, epochs=epochs, batch_size=batch_size, hidden_dim=hidden_dim, steps=steps, workers=workers, seed=seed, amp=amp)
 
     print("\n🎉 Full experiment finished.\n")
 
@@ -297,6 +304,14 @@ def menu():
     parser.add_argument("--dataset", choices=["qemu", "ffmpeg"])
 
     parser.add_argument("--edge-types")
+    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--hidden-dim", type=int, default=200)
+    parser.add_argument("--steps", type=int, default=6)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no-amp", action="store_true")
 
     parser.add_argument("--full-experiment", action="store_true")
 
@@ -309,14 +324,19 @@ def menu():
         return
 
     if args.full_experiment:
-        run_full_experiment()
+        run_full_experiment(folds=args.folds, epochs=args.epochs, batch_size=args.batch_size, hidden_dim=args.hidden_dim, steps=args.steps, workers=args.workers, seed=args.seed, amp=not args.no_amp)
         return
 
     if args.dataset:
 
         combos = parse_edge_combinations(args.edge_types)
 
-        run_pipeline(args.dataset, combos)
+        for combo in combos:
+            train_model(
+                args.dataset, combo, folds=args.folds, epochs=args.epochs,
+                batch_size=args.batch_size, hidden_dim=args.hidden_dim,
+                steps=args.steps, workers=args.workers, seed=args.seed, amp=not args.no_amp
+            )
 
         return
 
@@ -389,7 +409,7 @@ def menu():
             run_pipeline("ffmpeg")
 
         elif choice == "12":
-            run_full_experiment()
+            run_full_experiment(folds=args.folds, epochs=args.epochs, batch_size=args.batch_size, hidden_dim=args.hidden_dim, steps=args.steps, workers=args.workers, seed=args.seed, amp=not args.no_amp)
 
         elif choice == "13":
             clean_workspace()
