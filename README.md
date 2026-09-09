@@ -136,10 +136,11 @@ Workers     : 4
 Architecture: Skip-gram
 ```
 
-The resulting model is saved as:
+The resulting model is saved per project as:
 
 ```text
-models/code_w2v.model
+models/code_w2v_qemu.model
+models/code_w2v_ffmpeg.model
 ```
 
 The implementation uses the same tokenizer during Word2Vec training and graph feature construction to maintain compatibility between the embeddings and graph features.
@@ -179,33 +180,12 @@ for a total of **138 input features per graph node**.
 
 ## GGNN Model
 
-The graph classification model is based on a **Gated Graph Neural Network (GGNN)** implemented using PyTorch Geometric.
+The graph classifier follows the Devign design while extending the edge vocabulary to the three representations studied in this thesis. Each node starts from a 138-dimensional representation (100-dimensional Word2Vec embedding, 32-dimensional node-type embedding, and 6 handcrafted features).
 
-The architecture contains:
+The model then applies a **6-step relation-aware GGNN**. AST, CFG, and PDG edges are represented by separate relation weights inside an `RGCNConv`, followed by a `GRUCell` update. The final graph readout uses the Devign-style dual Conv1d pathways: one processes `[initial features, final hidden state]`, the other processes the final hidden state, and their sequence-level outputs are multiplied before graph-level reduction.
 
-```text
-Input Node Features
-        │
-        ▼
-Linear Node Encoder
-        │
-        ▼
-Relation-aware GGNN update × 6
-(AST / CFG / PDG edge-specific transforms)
-        │
-        ▼
-Attention-based Graph Pooling
-        │
-        ▼
-MLP Classifier
-        │
-        ▼
-Vulnerability Probability
-```
+This matters for the ablation: selecting `AST`, `CFG`, or `PDG` actually filters the corresponding relation edges before message passing, and combinations retain all selected relation types.
 
-The default hidden dimension is **200** and the graph state is updated for **6 propagation steps**. Edge types are explicitly used during message passing, so AST, CFG, and PDG relations are not collapsed into one undifferentiated adjacency matrix.
-
----
 
 ## Training Configuration
 
@@ -232,6 +212,18 @@ The implementation uses a `WeightedRandomSampler` during training so each fold s
 For each fold, the checkpoint is selected by validation F1 (AUC and accuracy are tie-breakers), the classification threshold is selected on that fold's validation partition, and the final reported score is the fixed-threshold score of the selected checkpoint. Results are aggregated as mean ± standard deviation across the 5 folds and saved under `results/`.
 
 ---
+
+## Runtime and GPU optimization
+
+For Kaggle GPU runs, the trainer is configured to avoid the two main throughput bottlenecks in the original implementation:
+
+* Graph `.pt` files are preloaded once into RAM instead of being reopened on every training sample and epoch.
+* The Devign Conv readout is vectorized with `to_dense_batch`, so graphs in a mini-batch are processed by the Conv1d layers in GPU batches rather than with a Python loop over graphs.
+
+CUDA AMP is enabled by default, pinned host memory is used for CUDA transfers, and worker processes use Linux `fork` so the read-only graph cache can be shared. The trainer prints peak allocated VRAM after every fold.
+
+On a Kaggle Tesla T4, start with `--batch-size 128`. Increase it only after confirming the reported peak VRAM and runtime; filling VRAM is not itself a correctness objective.
+
 
 ## Evaluation Metrics
 

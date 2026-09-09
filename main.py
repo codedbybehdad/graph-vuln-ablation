@@ -170,7 +170,7 @@ def build_dataset(dataset):
     run_command(cmd)
 
 
-def train_model(dataset, edge_types="AST,CFG", folds=5, epochs=60, batch_size=64, hidden_dim=200, steps=6, workers=4, seed=42, amp=True):
+def train_model(dataset, edge_types="AST,CFG", folds=5, epochs=60, batch_size=128, hidden_dim=200, steps=6, workers=4, seed=42, amp=True):
 
     if isinstance(edge_types, list):
         edge_types = ",".join(edge_types)
@@ -261,7 +261,7 @@ def parse_edge_combinations(edge_input):
     return [normalize_edge_combo(edge_input)]
 
 
-def run_pipeline(dataset, edge_combinations=None, folds=5, epochs=60, batch_size=64, hidden_dim=200, steps=6, workers=4, seed=42, amp=True):
+def run_pipeline(dataset, edge_combinations=None, folds=5, epochs=60, batch_size=128, hidden_dim=200, steps=6, workers=4, seed=42, amp=True):
 
     if edge_combinations is None:
         edge_combinations = ["AST,CFG"]
@@ -285,7 +285,7 @@ def run_pipeline(dataset, edge_combinations=None, folds=5, epochs=60, batch_size
     print(f"\n✅ Pipeline finished for {dataset.upper()}.")
 
 
-def run_full_experiment(folds=5, epochs=60, batch_size=64, hidden_dim=200, steps=6, workers=4, seed=42, amp=True):
+def run_full_experiment(folds=5, epochs=60, batch_size=128, hidden_dim=200, steps=6, workers=4, seed=42, amp=True):
 
     datasets = ["qemu", "ffmpeg"]
 
@@ -306,7 +306,7 @@ def menu():
     parser.add_argument("--edge-types")
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=200)
     parser.add_argument("--steps", type=int, default=6)
     parser.add_argument("--workers", type=int, default=4)

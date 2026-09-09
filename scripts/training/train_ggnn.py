@@ -17,6 +17,8 @@ import torch.nn.functional as F
 
 from torch.utils.data import Dataset, WeightedRandomSampler
 from torch_geometric.loader import DataLoader
+from torch_geometric.nn import RGCNConv
+from torch_geometric.utils import to_dense_batch
 
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import (
@@ -55,9 +57,11 @@ def seed_worker(worker_id):
 # ------------------------------------------------------------
 
 class GraphDataset(Dataset):
-    def __init__(self, items, edge_mode="all"):
+    def __init__(self, items, edge_mode="all", graph_cache=None):
         self.items = items
         self.edge_mode = edge_mode.lower()
+        # Reuse preloaded Data objects across folds/configurations.
+        self.graph_cache = graph_cache
 
     def __len__(self):
         return len(self.items)
@@ -72,22 +76,25 @@ class GraphDataset(Dataset):
             for token in self.edge_mode.split("+")
             if token.strip() in edge_type_map
         }
-
         if not selected:
             raise ValueError(f"Unknown edge mode: {self.edge_mode}")
 
-        mask = torch.zeros_like(data.edge_type, dtype=torch.bool)
+        mask = torch.zeros(data.edge_type.numel(), dtype=torch.bool)
         for edge_id in selected:
-            mask |= data.edge_type == edge_id
+            mask |= data.edge_type.cpu() == edge_id
 
-        # Preserve the complete node set and only remove connections.
-        data.edge_index = data.edge_index[:, mask]
-        data.edge_type = data.edge_type[mask]
-        return data
+        # Build a lightweight shallow copy so the cached graph is never mutated.
+        filtered = data.clone()
+        filtered.edge_index = data.edge_index[:, mask]
+        filtered.edge_type = data.edge_type[mask]
+        return filtered
 
     def __getitem__(self, idx):
         item = self.items[idx]
-        data = torch.load(item["path"], weights_only=False)
+        if self.graph_cache is not None:
+            data = self.graph_cache[item["file_id"]]
+        else:
+            data = torch.load(item["path"], weights_only=False)
         return self.filter_edges(data)
 
 
@@ -96,36 +103,25 @@ class GraphDataset(Dataset):
 # ------------------------------------------------------------
 
 class RelationGGNNLayer(nn.Module):
-    """One GGNN propagation step with one learned transform per relation."""
+    """One Devign-style multi-relational GGNN propagation step."""
 
     def __init__(self, hidden_dim, num_relations=3):
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_relations = num_relations
-        self.relation_linears = nn.ModuleList(
-            [nn.Linear(hidden_dim, hidden_dim, bias=False) for _ in range(num_relations)]
+        self.rgcn = RGCNConv(
+            in_channels=hidden_dim,
+            out_channels=hidden_dim,
+            num_relations=num_relations,
+            aggr="sum",
         )
         self.gru = nn.GRUCell(hidden_dim, hidden_dim)
 
     def forward(self, h, edge_index, edge_type):
-        src, dst = edge_index
-        aggregated = torch.zeros_like(h)
-
-        for relation_id, linear in enumerate(self.relation_linears):
-            mask = edge_type == relation_id
-            if not torch.any(mask):
-                continue
-            relation_src = src[mask]
-            relation_dst = dst[mask]
-            messages = linear(h[relation_src])
-            aggregated.index_add_(0, relation_dst, messages)
-
-        # Paper-style gated recurrent update: new state = GRU(old state, aggregate).
-        return self.gru(aggregated, h)
+        messages = self.rgcn(h, edge_index, edge_type)
+        return self.gru(messages, h)
 
 
 class GGNN(nn.Module):
-    """Multi-relational GGNN + Devign-inspired dual Conv1d readout."""
+    """Devign-style multi-relational GGNN with sequence-level Conv readout."""
 
     def __init__(self, in_channels, hidden_dim=200, num_steps=6, num_relations=3):
         super().__init__()
@@ -133,65 +129,74 @@ class GGNN(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_steps = num_steps
 
-        # Devign initializes the hidden state by copying the annotation and
-        # padding with zeros when hidden_dim > input_dim.
+        # Devign pads the initial node representation to the GGNN hidden size.
+        # A learned projection is used only when the experiment adds features.
         self.input_projection = (
             nn.Identity()
             if in_channels == hidden_dim
             else nn.Linear(in_channels, hidden_dim)
         )
-
         self.ggnn = RelationGGNNLayer(hidden_dim, num_relations=num_relations)
 
-        # The Conv module follows the paper's idea of applying the same 1-D
-        # convolution stack to [H^T, X] and H^T and combining both signals.
-        concat_channels = hidden_dim + in_channels
-        self.conv_z1 = nn.Conv1d(concat_channels, 64, kernel_size=3, padding=1)
-        self.conv_z2 = nn.Conv1d(64, 32, kernel_size=1, padding=1)
-        self.conv_y1 = nn.Conv1d(hidden_dim, 64, kernel_size=3, padding=1)
-        self.conv_y2 = nn.Conv1d(64, 32, kernel_size=1, padding=1)
+        self.conv1_z = nn.Conv1d(
+            hidden_dim + in_channels, 64, kernel_size=3, padding=1
+        )
+        self.pool1_z = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+        self.conv2_z = nn.Conv1d(64, 32, kernel_size=1, padding=0)
+        self.pool2_z = nn.MaxPool1d(kernel_size=2, stride=2, padding=1)
+        self.mlp_z = nn.Linear(32, 1)
 
-        self.fc_z = nn.Linear(32, 1)
-        self.fc_y = nn.Linear(32, 1)
-        self.dropout = nn.Dropout(0.2)
+        self.conv1_y = nn.Conv1d(hidden_dim, 64, kernel_size=3, padding=1)
+        self.pool1_y = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+        self.conv2_y = nn.Conv1d(64, 32, kernel_size=1, padding=0)
+        self.pool2_y = nn.MaxPool1d(kernel_size=2, stride=2, padding=1)
+        self.mlp_y = nn.Linear(32, 1)
 
-    def _conv_branch(self, seq, conv1, conv2):
-        # seq: [nodes, channels]. Treat nodes as the temporal/ordered axis.
-        seq = seq.transpose(0, 1).unsqueeze(0)  # [1, C, N]
+    @staticmethod
+    def _branch(dense_seq, valid, conv1, pool1, conv2, pool2, mlp):
+        # dense_seq: [B, N, C], valid: [B, N]. Keep each graph independent
+        # while allowing Conv1d to process the whole batch in one GPU call.
+        seq = dense_seq.transpose(1, 2)  # [B, C, N]
         seq = F.relu(conv1(seq))
-        seq = F.max_pool1d(seq, kernel_size=3, stride=2, ceil_mode=True)
+
+        valid_f = valid.unsqueeze(1).to(dtype=seq.dtype)
+        valid_f = F.max_pool1d(valid_f, kernel_size=3, stride=2, padding=1)
+        seq = pool1(seq)
+
         seq = F.relu(conv2(seq))
-        seq = F.max_pool1d(seq, kernel_size=2, stride=2, ceil_mode=True)
-        seq = seq.mean(dim=-1).squeeze(0)  # [C]
-        return seq
+        valid_f = F.max_pool1d(valid_f, kernel_size=2, stride=2, padding=1)
+        seq = pool2(seq)
+
+        node_scores = mlp(seq.transpose(1, 2)).squeeze(-1)
+        valid_f = valid_f.squeeze(1)
+        node_scores = node_scores * valid_f
+        denom = valid_f.sum(dim=1).clamp_min(1.0)
+        return node_scores.sum(dim=1) / denom
 
     def forward(self, x, edge_index, edge_type, batch):
         h = self.input_projection(x)
-
-        # Sequential gated message passing.  Edge type is used at every step.
         for _ in range(self.num_steps):
             h = self.ggnn(h, edge_index, edge_type)
 
-        graph_logits = []
-        num_graphs = int(batch.max().item()) + 1 if batch.numel() else 0
+        # Vectorized per-graph Conv readout. to_dense_batch preserves the
+        # original node order while isolating graphs in the batch.
+        h_dense, valid = to_dense_batch(h, batch)
+        x_dense, _ = to_dense_batch(x, batch)
 
-        for graph_id in range(num_graphs):
-            mask = batch == graph_id
-            hg = h[mask]
-            xg = x[mask]
+        z = self._branch(
+            torch.cat([h_dense, x_dense], dim=-1),
+            valid,
+            self.conv1_z, self.pool1_z, self.conv2_z, self.pool2_z, self.mlp_z,
+        )
+        y = self._branch(
+            h_dense,
+            valid,
+            self.conv1_y, self.pool1_y, self.conv2_y, self.pool2_y, self.mlp_y,
+        )
 
-            # Devign-style dual branch on the graph's ordered node sequence.
-            z_input = torch.cat([hg, xg], dim=1)
-            z = self._conv_branch(z_input, self.conv_z1, self.conv_z2)
-            y = self._conv_branch(hg, self.conv_y1, self.conv_y2)
-
-            z_logit = self.fc_z(z)
-            y_logit = self.fc_y(y)
-            pairwise_logit = z_logit * y_logit
-
-            graph_logits.append(pairwise_logit.reshape(1))
-
-        return torch.cat(graph_logits, dim=0)
+        # Devign-style pairwise interaction occurs at the node/sequence level
+        # before the graph reduction. The result is a raw logit for BCEWithLogitsLoss.
+        return z * y
 
 
 # ------------------------------------------------------------
@@ -307,8 +312,8 @@ def make_loader(dataset, batch_size, train, workers, pin_memory, seed):
     generator = torch.Generator()
     generator.manual_seed(seed)
 
-    return DataLoader(
-        dataset,
+    kwargs = dict(
+        dataset=dataset,
         batch_size=batch_size,
         sampler=build_sampler(dataset.items) if train else None,
         shuffle=False,
@@ -318,14 +323,20 @@ def make_loader(dataset, batch_size, train, workers, pin_memory, seed):
         worker_init_fn=seed_worker if workers > 0 else None,
         generator=generator,
     )
+    if workers > 0:
+        kwargs["prefetch_factor"] = 2
+        # Kaggle uses Linux; fork lets workers share the read-only RAM cache
+        # without serializing every cached graph into each worker.
+        kwargs["multiprocessing_context"] = "fork"
+    return DataLoader(**kwargs)
 
 
-def train_fold(args, train_items, val_items, fold_id, device):
+def train_fold(args, train_items, val_items, fold_id, device, graph_cache):
     fold_seed = args.seed + fold_id
     set_seed(fold_seed)
 
-    train_dataset = GraphDataset(train_items, edge_mode=args.edges)
-    val_dataset = GraphDataset(val_items, edge_mode=args.edges)
+    train_dataset = GraphDataset(train_items, edge_mode=args.edges, graph_cache=graph_cache)
+    val_dataset = GraphDataset(val_items, edge_mode=args.edges, graph_cache=graph_cache)
 
     pin_memory = device.type == "cuda"
     train_loader = make_loader(
@@ -358,7 +369,7 @@ def train_fold(args, train_items, val_items, fold_id, device):
     )
 
     amp_enabled = bool(device.type == "cuda" and not args.no_amp)
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled) if device.type == "cuda" else None
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled) if device.type == "cuda" else None
 
     os.makedirs(args.model_dir, exist_ok=True)
     os.makedirs(args.results_dir, exist_ok=True)
@@ -467,7 +478,7 @@ def main():
     ])
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--hidden_dim", type=int, default=200)
     parser.add_argument("--steps", type=int, default=6)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -503,6 +514,14 @@ def main():
     dataset_items = meta["graphs"]
     labels = np.asarray([item["label"] for item in dataset_items], dtype=np.int64)
 
+    print("💾 Preloading graph objects into RAM for fast CV training...")
+    graph_cache = {}
+    for i, item in enumerate(dataset_items):
+        graph_cache[item["file_id"]] = torch.load(item["path"], weights_only=False)
+        if (i + 1) % 1000 == 0:
+            print(f"   cached {i + 1}/{len(dataset_items)} graphs")
+    print(f"✅ Cached {len(graph_cache)} graphs")
+
     print(
         f"📦 {args.dataset.upper()} graphs: {len(dataset_items)} | "
         f"positive={int(labels.sum())} negative={int((labels == 0).sum())}"
@@ -525,7 +544,7 @@ def main():
         print(f"FOLD {fold_id}/{args.folds}: train={len(train_items)} val={len(val_items)}")
         print("=" * 72)
 
-        result = train_fold(args, train_items, val_items, fold_id, device)
+        result = train_fold(args, train_items, val_items, fold_id, device, graph_cache)
         all_fold_results.append(result)
         if device.type == "cuda":
             peak_gib = torch.cuda.max_memory_allocated(device) / (2 ** 30)
