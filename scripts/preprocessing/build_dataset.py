@@ -49,7 +49,7 @@ if not os.path.exists(LABEL_FILE):
         f"\n❌ Label file not found:\n  {LABEL_FILE}\n"
     )
 
-W2V_MODEL = os.path.join(BASE_DIR, "models/code_w2v.model")
+W2V_MODEL = os.path.join(BASE_DIR, f"models/code_w2v_{DATASET}.model")
 
 OUTPUT_DIR = os.path.join(
     BASE_DIR,
@@ -302,9 +302,14 @@ for idx, path in enumerate(graph_files):
 
             handcrafted = build_handcrafted_features(tokens,code)
 
-            feature = normalize_vector(
-                np.concatenate([emb,type_emb,handcrafted])
-            )
+            # Keep the three feature blocks at their intended scales.
+            # The Word2Vec block is normalized in build_embedding();
+            # the node-type embedding and handcrafted features are
+            # concatenated without normalizing the complete 138-D vector.
+            # Normalizing the complete vector would unnecessarily couple
+            # the scales of the three feature blocks and can suppress the
+            # handcrafted signals.
+            feature = np.concatenate([emb,type_emb,handcrafted]).astype(np.float32)
 
             x.append(feature)
 
@@ -355,6 +360,8 @@ for idx, path in enumerate(graph_files):
 
 FINAL_FEATURE_DIM = EMBED_SIZE + NODE_TYPE_EMBED_DIM + 6
 
+coverage = 0.0 if total_nodes == 0 else 100.0 * (total_nodes - zero_embed_nodes) / total_nodes
+print(f"🧠 Word2Vec node coverage: {coverage:.2f}% ({total_nodes - zero_embed_nodes}/{total_nodes})")
 print("\n💾 Saving dataset index...")
 
 torch.save(

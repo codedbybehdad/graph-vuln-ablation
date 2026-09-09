@@ -10,13 +10,20 @@ import shutil
 import argparse
 
 
-LOCAL_JOERN_DIR = "./joern/joern-cli"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-JOERN_PARSE = os.path.join(LOCAL_JOERN_DIR, "joern-parse")
-JOERN = os.path.join(LOCAL_JOERN_DIR, "joern")
-JOERN_EXPORT = os.path.join(LOCAL_JOERN_DIR, "joern-export")
+# Keep the original repository layout, but resolve paths relative to this file
+# so the CLI works even when it is launched from another working directory.
+LOCAL_JOERN_DIR = os.path.join(BASE_DIR, "joern", "joern-cli")
+JOERN_DATAFLOW_SCRIPT = os.path.join(BASE_DIR, "joern", "run_dataflow.sc")
 
-JOERN_DATAFLOW_SCRIPT = "joern/run_dataflow.sc"
+# Optional override for an existing Joern installation.
+# Example: export JOERN_HOME=/path/to/joern/joern-cli
+JOERN_DIR = os.environ.get("JOERN_HOME", LOCAL_JOERN_DIR)
+
+JOERN_PARSE = os.path.join(JOERN_DIR, "joern-parse")
+JOERN = os.path.join(JOERN_DIR, "joern")
+JOERN_EXPORT = os.path.join(JOERN_DIR, "joern-export")
 
 
 def run_command(command_list):
@@ -44,31 +51,43 @@ def run_command(command_list):
 def split_dataset(dataset):
     cmd = [
         sys.executable,
-        "scripts/preprocessing/splitIntoFiles.py",
+        os.path.join(BASE_DIR, "scripts/preprocessing/splitIntoFiles.py"),
         "--project",
         dataset,
     ]
     run_command(cmd)
 
 
-def train_w2v_if_needed():
-    model_path = "models/code_w2v.model"
+def train_w2v_if_needed(dataset):
+    # Train and cache a separate embedding model for each project.
+    # This prevents a QEMU-only Word2Vec model from being reused for FFmpeg.
+    model_path = f"models/code_w2v_{dataset}.model"
 
     if os.path.exists(model_path):
-        print("✅ Word2Vec model already exists. Skipping.\n")
+        print(f"✅ Word2Vec model for {dataset.upper()} already exists. Skipping.\n")
         return
 
-    print("🧠 Training Word2Vec...\n")
+    print(f"🧠 Training Word2Vec for {dataset.upper()}...\n")
 
     cmd = [
         sys.executable,
-        "scripts/preprocessing/train_w2v.py",
+        os.path.join(BASE_DIR, "scripts/preprocessing/train_w2v.py"),
+        "--dataset",
+        dataset,
     ]
     run_command(cmd)
 
 
 def run_joern(dataset):
-    code_dir = f"data/intermediate/{dataset}_code"
+    code_dir = os.path.join(BASE_DIR, "data", "intermediate", f"{dataset}_code")
+
+    missing = [p for p in (JOERN_PARSE, JOERN, JOERN_EXPORT) if not os.path.isfile(p) or not os.access(p, os.X_OK)]
+    if missing:
+        print("\n❌ Joern executable(s) not found or not executable:")
+        for p in missing:
+            print(f"   {p}")
+        print("\nPlace the Joern executables in joern/joern-cli/ or set JOERN_HOME to an existing Joern installation.")
+        sys.exit(1)
     cpg_file = "data/intermediate/devign.cpg"
 
     graph_dir = "data/intermediate/graphs"
@@ -143,7 +162,7 @@ def build_dataset(dataset):
 
     cmd = [
         sys.executable,
-        "scripts/preprocessing/build_dataset.py",
+        os.path.join(BASE_DIR, "scripts/preprocessing/build_dataset.py"),
         "--dataset",
         dataset
     ]
@@ -162,7 +181,7 @@ def train_model(dataset, edge_types="AST,CFG"):
 
     cmd = [
         sys.executable,
-        "scripts/training/train_ggnn.py",
+        os.path.join(BASE_DIR, "scripts/training/train_ggnn.py"),
         "--dataset",
         dataset,
         "--edges",
@@ -245,7 +264,7 @@ def run_pipeline(dataset, edge_combinations=None):
     print("=====================================\n")
 
     split_dataset(dataset)
-    train_w2v_if_needed()
+    train_w2v_if_needed(dataset)
     run_joern(dataset)
 
     print("\n--- Building dataset (once) ---")
@@ -330,7 +349,8 @@ def menu():
             split_dataset("ffmpeg")
 
         elif choice == "3":
-            train_w2v_if_needed()
+            dataset = input("Dataset for Word2Vec (qemu/ffmpeg): ").strip().lower()
+            train_w2v_if_needed(dataset)
 
         elif choice == "4":
             run_joern("qemu")

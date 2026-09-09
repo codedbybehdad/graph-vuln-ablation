@@ -104,30 +104,24 @@ class GraphDataset(Dataset):
 
 
 def split_dataset(index_items):
-
+    """
+    Devign-paper-style split: randomly shuffle and use 75% for
+    training and 25% for validation. The paper does not define a
+    separate test split for the main Table 2 results.
+    """
     labels = [item["label"] for item in index_items]
 
-    train_idx, temp_idx = train_test_split(
+    train_idx, val_idx = train_test_split(
         range(len(index_items)),
-        test_size=0.2,
+        test_size=0.25,
         stratify=labels,
-        random_state=42
-    )
-
-    temp_labels = [labels[i] for i in temp_idx]
-
-    val_idx, test_idx = train_test_split(
-        temp_idx,
-        test_size=0.5,
-        stratify=temp_labels,
         random_state=42
     )
 
     train_items = [index_items[i] for i in train_idx]
     val_items = [index_items[i] for i in val_idx]
-    test_items = [index_items[i] for i in test_idx]
 
-    return train_items, val_items, test_items
+    return train_items, val_items
 
 
 class GGNN(nn.Module):
@@ -247,7 +241,7 @@ def train_epoch(model, loader, optimizer, criterion, device):
     return total_loss / len(loader)
 
 
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, threshold=None, select_threshold=False):
 
     model.eval()
 
@@ -277,22 +271,26 @@ def evaluate(model, loader, device):
     probs_all = np.array(probs_all)
     labels_all = np.array(labels_all)
 
-    best_acc = 0.0
-    best_threshold = 0.5
+    # Devign-paper reporting uses the standard 0.5 classification threshold.
+    # Threshold tuning is retained only as an optional utility for non-paper runs.
+    if threshold is None:
+        threshold = 0.5
 
-    for t in np.arange(0.1, 0.91, 0.02):
+    if select_threshold:
+        best_acc = -1.0
+        best_threshold = 0.5
 
-        current_preds = (probs_all > t).astype(int)
+        for t in np.arange(0.1, 0.91, 0.02):
+            current_preds = (probs_all >= t).astype(int)
+            current_acc = accuracy_score(labels_all, current_preds)
 
-        current_acc = accuracy_score(labels_all, current_preds)
+            if current_acc > best_acc:
+                best_acc = current_acc
+                best_threshold = float(t)
 
-        if current_acc > best_acc:
-            best_acc = current_acc
-            best_threshold = t
+        threshold = best_threshold
 
-    threshold = best_threshold
-
-    preds = (probs_all > threshold).astype(int)
+    preds = (probs_all >= threshold).astype(int)
 
     if len(np.unique(labels_all)) < 2:
         auc = 0.5
@@ -300,19 +298,12 @@ def evaluate(model, loader, device):
         auc = roc_auc_score(labels_all, probs_all)
 
     metrics = {
-
         "accuracy": accuracy_score(labels_all, preds),
-
         "precision": precision_score(labels_all, preds, zero_division=0),
-
         "recall": recall_score(labels_all, preds, zero_division=0),
-
         "f1": f1_score(labels_all, preds, zero_division=0),
-
         "auc": auc,
-
-        "threshold": threshold,
-
+        "threshold": float(threshold),
         "logit_mean": float(np.mean(logits_all)),
         "prob_mean": float(np.mean(probs_all)),
         "prob_std": float(np.std(probs_all))
@@ -326,8 +317,10 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--dataset", type=str, required=True, choices=["qemu", "ffmpeg"])
-    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--patience", type=int, default=100)
 
     parser.add_argument(
         "--edges",
@@ -356,12 +349,10 @@ def main():
 
     dataset_items = meta["graphs"]
 
-    train_items, val_items, test_items = split_dataset(dataset_items)
+    train_items, val_items = split_dataset(dataset_items)
 
     train_dataset = GraphDataset(train_items, edge_mode=args.edges)
     val_dataset = GraphDataset(val_items, edge_mode=args.edges)
-    test_dataset = GraphDataset(test_items, edge_mode=args.edges)
-
     train_labels = [item["label"] for item in train_items]
 
     class_counts = np.bincount(train_labels)
@@ -373,7 +364,6 @@ def main():
 
     train_loader = DataLoader(train_dataset,batch_size=args.batch_size,sampler=sampler)
     val_loader = DataLoader(val_dataset,batch_size=args.batch_size)
-    test_loader = DataLoader(test_dataset,batch_size=args.batch_size)
 
     sample = train_dataset[0]
     in_channels = sample.x.shape[1]
@@ -384,7 +374,7 @@ def main():
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    optimizer = torch.optim.AdamW(model.parameters(),lr=5e-4,weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(),lr=args.lr,weight_decay=1e-4)
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,mode="max",factor=0.5,patience=4
@@ -393,7 +383,9 @@ def main():
     os.makedirs("models", exist_ok=True)
     os.makedirs("results", exist_ok=True)
 
-    best_auc = 0.0
+    best_accuracy = -1.0
+    best_f1 = -1.0
+    epochs_without_improvement = 0
 
     train_losses = []
     val_f1s = []
@@ -405,9 +397,9 @@ def main():
 
         train_loss = train_epoch(model,train_loader,optimizer,criterion,device)
 
-        val_metrics = evaluate(model,val_loader,device)
+        val_metrics = evaluate(model,val_loader,device,threshold=0.5,select_threshold=False)
 
-        scheduler.step(val_metrics["auc"])
+        scheduler.step(val_metrics["accuracy"])
 
         train_losses.append(train_loss)
         val_f1s.append(val_metrics["f1"])
@@ -425,9 +417,12 @@ def main():
         print(f"Threshold: {val_metrics['threshold']:.2f}")
         print(f"Learning Rate: {current_lr:.6f}")
 
-        if val_metrics["auc"] > best_auc:
+        if (val_metrics["accuracy"] > best_accuracy or
+                (val_metrics["accuracy"] == best_accuracy and val_metrics["f1"] > best_f1)):
 
-            best_auc = val_metrics["auc"]
+            best_accuracy = val_metrics["accuracy"]
+            best_f1 = val_metrics["f1"]
+            epochs_without_improvement = 0
 
             torch.save(
                 model.state_dict(),
@@ -435,6 +430,12 @@ def main():
             )
 
             print("✅ Best model updated")
+        else:
+            epochs_without_improvement += 1
+
+            if epochs_without_improvement >= args.patience:
+                print(f"\n⏹ Early stopping after {epoch+1} epochs")
+                break
 
     print("\n📥 Loading best model...")
 
@@ -445,17 +446,23 @@ def main():
         )
     )
 
-    test_metrics = evaluate(model,test_loader,device)
+    final_metrics = evaluate(model,val_loader,device,threshold=0.5)
+    final_metrics["evaluation_split"] = "validation"
+    final_metrics["split_ratio"] = "75% train / 25% validation"
+    final_metrics["selection_metric"] = "validation accuracy (F1 tie-breaker; paper does not specify the checkpoint criterion)"
+    final_metrics["reported_metrics"] = ["accuracy", "f1"]
+    final_metrics["devign_paper_reporting"] = True
 
-    print("\n✅ FINAL TEST RESULTS\n")
-    print(json.dumps(test_metrics, indent=4))
+    print("\n✅ FINAL VALIDATION RESULTS (DEVIGN-PAPER REPORTING)\n")
+    print(json.dumps(final_metrics, indent=4))
 
     result_file = f"results/{args.dataset}_{args.edges}_metrics.json"
 
     with open(result_file,"w") as f:
-        json.dump(test_metrics,f,indent=4)
+        json.dump(final_metrics,f,indent=4)
 
     print(f"\n📁 Results saved to {result_file}")
+    print("📌 Reported metrics are validation Accuracy/F1, matching the evaluation split described in the Devign paper.")
 
     plt.figure()
     plt.plot(train_losses,label="Train Loss")

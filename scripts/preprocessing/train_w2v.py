@@ -11,7 +11,7 @@ vector representations for the GGNN input features.
 
 The model is saved to:
 
-    models/code_w2v.model
+    models/code_w2v_<dataset>.model
 
 This script should be run AFTER:
 
@@ -30,11 +30,12 @@ Activate virtual environment first:
 
 Then run:
 
-    python scripts/preprocessing/train_w2v.py
+    python scripts/preprocessing/train_w2v.py --dataset qemu
 """
 
 import os
 import re
+import argparse
 from gensim.models import Word2Vec
 
 
@@ -60,9 +61,14 @@ BASE_DIR = os.path.abspath(
 #   data/intermediate/qemu_code/
 #   data/intermediate/ffmpeg_code/
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--dataset", required=True, choices=["qemu", "ffmpeg"])
+args = parser.parse_args()
+DATASET = args.dataset
+
 DATA_DIR = os.path.join(
     BASE_DIR,
-    "data/intermediate"
+    f"data/intermediate/{DATASET}_code"
 )
 
 
@@ -77,7 +83,7 @@ MODEL_DIR = os.path.join(
 
 MODEL_PATH = os.path.join(
     MODEL_DIR,
-    "code_w2v.model"
+    f"code_w2v_{DATASET}.model"
 )
 
 os.makedirs(
@@ -135,7 +141,10 @@ def tokenize_code(code):
 #       ...
 #   ]
 
-print("🔍 Scanning C source files for Word2Vec training...\n")
+if not os.path.exists(DATA_DIR):
+    raise FileNotFoundError(f"Code directory not found: {DATA_DIR}")
+
+print(f"🔍 Scanning {DATASET.upper()} C source files for Word2Vec training...\n")
 
 sentences = []
 total_files = 0

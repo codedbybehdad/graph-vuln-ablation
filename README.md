@@ -253,7 +253,7 @@ The trained models are evaluated using:
 * **F1-Score**
 * **ROC-AUC**
 
-The classification threshold is selected on the validation set by evaluating multiple thresholds and choosing the threshold that provides the highest validation accuracy.
+The classification threshold is selected on the validation set by evaluating multiple thresholds and choosing the threshold that provides the highest validation accuracy. The selected validation threshold is then fixed for final test evaluation.
 
 ---
 
@@ -407,7 +407,7 @@ The model will be saved as:
 models/code_w2v.model
 ```
 
-Word2Vec is trained using the extracted C source files from both supported projects.
+Word2Vec is trained separately for each project using that project's extracted C source files. This prevents the embedding vocabulary learned for one project from being reused as the sole embedding model for the other project.
 
 ---
 
@@ -690,3 +690,11 @@ Please consult the licenses of:
 * Other third-party dependencies
 
 before redistributing the repository or its generated artifacts.
+
+## Devign-paper reporting mode
+
+The training script supports a reporting configuration based on the settings explicitly stated in the Devign paper (Zhou et al., NeurIPS 2019): random stratified 75% training / 25% validation split, a standard 0.5 classification threshold, and Accuracy and F1 as the primary reported metrics. The paper states 100-epoch patience for early stopping. The script therefore defaults to 100 epochs and patience 100.
+
+The paper does not specify the exact metric used internally to choose an early-stopping checkpoint. This implementation uses validation Accuracy, with F1 as a tie-breaker, and records that choice explicitly in the results JSON. It does **not** present a separate test-set result for this reporting mode, because the main paper results are described as a 75% training / 25% validation evaluation.
+
+The reported Accuracy/F1 should therefore be compared with the paper's Accuracy/F1 table only as a reporting-protocol comparison; the architecture and preprocessing in this thesis implementation are not identical to the original Devign implementation.
