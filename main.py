@@ -26,6 +26,58 @@ JOERN = os.path.join(JOERN_DIR, "joern")
 JOERN_EXPORT = os.path.join(JOERN_DIR, "joern-export")
 
 
+
+def resolve_python_executable():
+    """
+    Select a Python interpreter that can import the project's runtime
+    dependencies. This is important on Kaggle, where `python` and `pip`
+    can sometimes resolve to different installations.
+    """
+    candidates = []
+
+    env_python = os.environ.get("PYTHON_EXECUTABLE")
+    if env_python:
+        candidates.append(env_python)
+
+    candidates.extend([
+        PYTHON_EXECUTABLE,
+        shutil.which("python") or "",
+        shutil.which("python3") or "",
+        "/opt/conda/bin/python",
+        "/opt/conda/bin/python3",
+        "/usr/local/bin/python",
+        "/usr/local/bin/python3",
+    ])
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+
+        if not os.path.isfile(candidate) and shutil.which(candidate) != candidate:
+            continue
+
+        try:
+            check = subprocess.run(
+                [candidate, "-c", "import torch_geometric"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if check.returncode == 0:
+                return candidate
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    # Fall back to the interpreter running main.py.
+    return sys.executable
+
+
+PYTHON_EXECUTABLE = resolve_python_executable()
+print(f"🐍 Python interpreter for pipeline scripts: {PYTHON_EXECUTABLE}")
+
+
 def run_command(command_list):
     try:
         print("\n▶ Running:")
@@ -50,7 +102,7 @@ def run_command(command_list):
 
 def split_dataset(dataset):
     cmd = [
-        sys.executable,
+        PYTHON_EXECUTABLE,
         os.path.join(BASE_DIR, "scripts/preprocessing/splitIntoFiles.py"),
         "--project",
         dataset,
@@ -70,7 +122,7 @@ def train_w2v_if_needed(dataset):
     print(f"🧠 Training Word2Vec for {dataset.upper()}...\n")
 
     cmd = [
-        sys.executable,
+        PYTHON_EXECUTABLE,
         os.path.join(BASE_DIR, "scripts/preprocessing/train_w2v.py"),
         "--dataset",
         dataset,
@@ -161,7 +213,7 @@ def build_dataset(dataset):
     print(f"\n⚙ Building dataset for {dataset}...\n")
 
     cmd = [
-        sys.executable,
+        PYTHON_EXECUTABLE,
         os.path.join(BASE_DIR, "scripts/preprocessing/build_dataset.py"),
         "--dataset",
         dataset
@@ -180,7 +232,7 @@ def train_model(dataset, edge_types="AST,CFG", folds=5, epochs=60, batch_size=12
     print(f"\n⚙ Training model for {dataset} with edges: {edges_arg}...\n")
 
     cmd = [
-        sys.executable,
+        PYTHON_EXECUTABLE,
         os.path.join(BASE_DIR, "scripts/training/train_ggnn.py"),
         "--dataset", dataset,
         "--edges", edges_arg,
