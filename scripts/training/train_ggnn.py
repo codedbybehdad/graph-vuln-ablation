@@ -200,12 +200,10 @@ class GGNN(nn.Module):
         denom = valid_nodes.sum(dim=1).clamp_min(1.0)
         graph_logits = (pairwise * valid_nodes).sum(dim=1) / denom
 
-        # Devign's published implementation applies the sigmoid after the
-        # sequence-level pairwise reduction. Returning probabilities here keeps
-        # the training/evaluation path faithful to that formulation.
-        return torch.sigmoid(graph_logits)
+        return graph_logits
 
     def forward(self, x, edge_index=None, edge_type=None, batch=None):
+        # Returns logits. Apply sigmoid only for evaluation/metric computation.
         # PyG DataParallel calls the wrapped module with a Data/Batch object.
         if hasattr(x, "x") and hasattr(x, "edge_index"):
             data = x
@@ -242,12 +240,14 @@ def evaluate(model, loader, device, threshold=None, select_threshold=False, mult
         for data in loader:
             if multi_gpu:
                 labels = torch.cat([d.y.view(-1).long() for d in data], dim=0)
-                probs = model(data)
+                logits = model(data)
+                probs = torch.sigmoid(logits)
                 labels_all.extend(labels.cpu().numpy())
                 probs_all.extend(probs.detach().cpu().numpy())
             else:
                 data = data.to(device, non_blocking=True)
-                probs = model(data.x, data.edge_index, data.edge_type, data.batch)
+                logits = model(data.x, data.edge_index, data.edge_type, data.batch)
+                probs = torch.sigmoid(logits)
                 probs_all.extend(probs.detach().cpu().numpy())
                 labels_all.extend(data.y.detach().view(-1).cpu().numpy())
 
@@ -309,11 +309,11 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler, amp_enabled
             enabled=amp_enabled,
         ):
             if multi_gpu:
-                probs = model(data)
-                loss = criterion(probs.clamp(1e-6, 1 - 1e-6), labels.to(probs.device))
+                logits = model(data)
+                loss = criterion(logits, labels.to(logits.device))
             else:
-                probs = model(data.x, data.edge_index, data.edge_type, data.batch)
-                loss = criterion(probs.clamp(1e-6, 1 - 1e-6), labels)
+                logits = model(data.x, data.edge_index, data.edge_type, data.batch)
+                loss = criterion(logits, labels)
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -396,9 +396,9 @@ def train_fold(args, train_items, val_items, fold_id, device, graph_cache, multi
     if multi_gpu:
         model = PyGDataParallel(base_model, device_ids=list(range(torch.cuda.device_count())))
 
-    # Devign-style readout returns probabilities, so use BCE on probabilities.
+    # Train on logits so BCE remains safe under CUDA autocast.
     # The weighted sampler balances classes without double-weighting the loss.
-    criterion = nn.BCELoss()
+    criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
