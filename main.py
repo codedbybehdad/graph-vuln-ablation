@@ -81,29 +81,24 @@ def train_w2v_if_needed(dataset):
 def run_joern(dataset):
     code_dir = os.path.join(BASE_DIR, "data", "intermediate", f"{dataset}_code")
 
-    missing = [p for p in (JOERN_PARSE, JOERN, JOERN_EXPORT) if not os.path.isfile(p) or not os.access(p, os.X_OK)]
+    missing = [p for p in (JOERN_PARSE, JOERN) if not os.path.isfile(p) or not os.access(p, os.X_OK)]
     if missing:
         print("\n❌ Joern executable(s) not found or not executable:")
         for p in missing:
             print(f"   {p}")
         print("\nPlace the Joern executables in joern/joern-cli/ or set JOERN_HOME to an existing Joern installation.")
         sys.exit(1)
-    cpg_file = "data/intermediate/devign.cpg"
+    cpg_file = os.path.join(BASE_DIR, "data", "intermediate", "devign.cpg")
 
-    graph_dir = "data/intermediate/graphs"
-    pdg_dir = "data/intermediate/pdg"
-
+    graph_dir = os.path.join(BASE_DIR, "data", "intermediate", "graphs")
     if not os.path.exists(code_dir):
         print(f"\n❌ Code directory not found: {code_dir}")
         sys.exit(1)
 
-    os.makedirs("data/intermediate", exist_ok=True)
+    os.makedirs(os.path.join(BASE_DIR, "data", "intermediate"), exist_ok=True)
 
     if os.path.exists(graph_dir):
         shutil.rmtree(graph_dir)
-
-    if os.path.exists(pdg_dir):
-        shutil.rmtree(pdg_dir)
 
     if os.path.exists(cpg_file):
         os.remove(cpg_file)
@@ -131,26 +126,18 @@ def run_joern(dataset):
         cpg_file
     ])
 
-    print("\n⚙ Exporting CPG graphs (AST + CFG)...\n")
+    print("\n⚙ Exporting AST + CFG + PDG graphs...\n")
 
+    # Export all three thesis edge families into the same per-function files.
+    # This avoids accidentally generating a PDG directory that the dataset
+    # builder never consumes.
     run_command([
-        JOERN_EXPORT,
-        "--repr",
-        "cpg14",
-        "--out",
-        graph_dir,
-        cpg_file
-    ])
-
-    print("\n⚙ Exporting PDG graphs...\n")
-
-    run_command([
-        JOERN_EXPORT,
-        "--repr",
-        "pdg",
-        "--out",
-        pdg_dir,
-        cpg_file
+        JOERN,
+        "--script",
+        os.path.join(BASE_DIR, "joern", "export_graphs.sc"),
+        "--",
+        code_dir,
+        graph_dir
     ])
 
     print("\n✅ Joern graph extraction finished.\n")

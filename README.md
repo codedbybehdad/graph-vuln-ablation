@@ -424,16 +424,16 @@ The main pipeline invokes:
 ```text
 joern-parse
 joern
-joern-export
+joern/export_graphs.sc
 ```
 
-to create the CPG, perform data-flow analysis, and export the required graph representations.
+to create the CPG, calculate data-flow information, and export one per-function graph file containing the AST, CFG, and PDG edge families used by the ablation experiments. This keeps all three edge families in the same source graph and prevents one representation from being silently omitted during dataset construction.
 
 ---
 
 ## Building the Graph Dataset
 
-Once the Joern graphs have been generated:
+Once the unified AST + CFG + PDG graph files have been generated:
 
 ```bash
 python scripts/preprocessing/build_dataset.py --dataset qemu

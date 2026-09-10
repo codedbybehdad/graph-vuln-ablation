@@ -355,6 +355,26 @@ def main():
     train_dataset = GraphDataset(train_items, edge_mode=args.edges)
     val_dataset = GraphDataset(val_items, edge_mode=args.edges)
 
+    # Sanity-check the requested edge channel before training. This makes it
+    # obvious when a graph export contains no edges of the requested type.
+    probe = train_dataset[0]
+    edge_counts = {
+        "AST": int((probe.edge_type == 0).sum().item()),
+        "CFG": int((probe.edge_type == 1).sum().item()),
+        "PDG": int((probe.edge_type == 2).sum().item()),
+    }
+    selected_counts = {
+        name: count
+        for name, count in edge_counts.items()
+        if name.lower() in args.edges.split("+")
+    }
+    print(f"\n🔎 First training graph edge counts after filtering ({args.edges}): {selected_counts}")
+    if sum(selected_counts.values()) == 0:
+        raise RuntimeError(
+            f"No edges remain for '{args.edges}'. "
+            "The graph export/edge mapping is invalid for this configuration."
+        )
+
     train_labels = [item["label"] for item in train_items]
 
     class_counts = np.bincount(train_labels)

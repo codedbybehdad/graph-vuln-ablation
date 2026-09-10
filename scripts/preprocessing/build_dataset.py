@@ -30,7 +30,8 @@ BASE_DIR = os.path.abspath(
     )
 )
 
-# Joern export directory (AST + CFG graphs)
+# Joern custom graph export directory. Each .txt file contains
+# AST, CFG, and PDG sections produced by joern/export_graphs.sc.
 GRAPH_DIR = os.path.join(BASE_DIR, "data/intermediate/graphs")
 
 if not os.path.exists(GRAPH_DIR):
@@ -89,16 +90,25 @@ print("🧠 Loading Word2Vec...")
 w2v = Word2Vec.load(W2V_MODEL)
 
 # =========================================================
-# REGEX
+# GRAPH EXPORT FORMAT
 # =========================================================
 
-NODE_RE = re.compile(
-    r'"(\d+)"\s+\[label\s*=\s*<(.*?),\s*\d+<BR/>(.*?)>\s*\]'
-)
+# The Joern script exports a sectioned text file:
+#   #NODES
+#   node_id|node_type|code
+#   #AST
+#   src dst
+#   #CFG
+#   src dst
+#   #PDG
+#   src dst
 
-EDGE_RE = re.compile(
-    r'"(\d+)"\s*->\s*"(\d+)"\s*\[\s*label\s*=\s*"(AST|CFG|DFG):'
-)
+NODE_SECTION = "NODES"
+EDGE_SECTIONS = {
+    "AST": 0,
+    "CFG": 1,
+    "PDG": 2,
+}
 
 TOKEN_RE = re.compile(
     r"""
@@ -121,7 +131,7 @@ TOKEN_RE = re.compile(
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # =========================================================
-# FIND DOT FILES RECURSIVELY
+# FIND EXPORTED GRAPH FILES RECURSIVELY
 # =========================================================
 
 print("🔍 Collecting graph files...")
@@ -130,14 +140,14 @@ graph_files = []
 
 for root, _, files in os.walk(GRAPH_DIR):
     for f in files:
-        if f.endswith(".dot"):
+        if f.endswith(".txt"):
             graph_files.append(os.path.join(root, f))
 
 graph_files = sorted(graph_files)
 
 if len(graph_files) == 0:
     raise RuntimeError(
-        f"\n❌ No .dot files found in:\n  {GRAPH_DIR}\n"
+        f"\n❌ No .txt graph files found in:\n  {GRAPH_DIR}\n"
     )
 
 print(f"📦 Found {len(graph_files)} graph files")
@@ -155,11 +165,18 @@ for idx, path in enumerate(graph_files):
     if idx % 1000 == 0:
         print(f"📦 Scanning node types: {idx}")
 
+    in_nodes = False
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
-            m = NODE_RE.search(line)
-            if m:
-                node_types_set.add(m.group(2).strip())
+            line = line.rstrip("\n")
+            if line.startswith("#"):
+                in_nodes = line[1:].strip().upper() == NODE_SECTION
+                continue
+            if not in_nodes or not line:
+                continue
+            parts = line.split("|", 2)
+            if len(parts) == 3:
+                node_types_set.add(parts[1].strip())
 
 node_types = sorted(list(node_types_set))[:MAX_NODE_TYPES]
 node_type_map = {t: i for i, t in enumerate(node_types)}
@@ -226,6 +243,7 @@ saved_graphs = 0
 failed_graphs = 0
 dataset_index = []
 feature_variances = []
+edge_totals = {"AST": 0, "CFG": 0, "PDG": 0}
 
 print("\n🏗️ Building dataset...\n")
 
@@ -251,32 +269,42 @@ for idx, path in enumerate(graph_files):
         node_info = {}
         edges = []
         edge_types = []
+        current_section = None
 
-        with open(path,"r",encoding="utf-8",errors="ignore") as f:
-            for line in f:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for raw_line in f:
+                line = raw_line.rstrip("\n")
 
-                nm = NODE_RE.search(line)
-                if nm:
-                    nid = int(nm.group(1))
-                    ntype = nm.group(2).strip()
-                    code = html.unescape(nm.group(3))
-                    code = re.sub(r"<.*?>"," ",code)
-                    node_info[nid] = (ntype,code)
+                if line.startswith("#"):
+                    current_section = line[1:].strip().upper()
                     continue
 
-                em = EDGE_RE.search(line)
-                if em:
-                    src = int(em.group(1))
-                    dst = int(em.group(2))
-                    etype = em.group(3)
-                    edges.append((src,dst))
+                if not line:
+                    continue
 
-                    if etype == "AST":
-                        edge_types.append(0)
-                    elif etype == "CFG":
-                        edge_types.append(1)
-                    else:
-                        edge_types.append(2)
+                if current_section == NODE_SECTION:
+                    parts = line.split("|", 2)
+                    if len(parts) != 3:
+                        continue
+                    try:
+                        nid = int(parts[0])
+                    except ValueError:
+                        continue
+                    ntype = parts[1].strip()
+                    code = parts[2]
+                    node_info[nid] = (ntype, code)
+
+                elif current_section in EDGE_SECTIONS:
+                    parts = line.split()
+                    if len(parts) != 2:
+                        continue
+                    try:
+                        src = int(parts[0])
+                        dst = int(parts[1])
+                    except ValueError:
+                        continue
+                    edges.append((src, dst))
+                    edge_types.append(EDGE_SECTIONS[current_section])
 
         if len(edges) == 0:
             continue
@@ -335,6 +363,10 @@ for idx, path in enumerate(graph_files):
         edge_index = torch.tensor(remapped_edges,dtype=torch.long).t().contiguous()
         edge_type = torch.tensor(valid_edge_types,dtype=torch.long)
 
+        edge_totals["AST"] += int((edge_type == 0).sum().item())
+        edge_totals["CFG"] += int((edge_type == 1).sum().item())
+        edge_totals["PDG"] += int((edge_type == 2).sum().item())
+
         data = Data(
             x=x,
             edge_index=edge_index,
@@ -377,6 +409,13 @@ torch.save(
 print("\n✅ Graphs saved:", saved_graphs)
 print("❌ Graphs failed:", failed_graphs)
 print("🧩 Total nodes:", total_nodes)
+print("🔗 Edge totals:", edge_totals)
+
+if any(edge_totals[name] == 0 for name in ("AST", "CFG", "PDG")):
+    raise RuntimeError(
+        "At least one required edge family has zero edges in the built dataset: "
+        f"{edge_totals}"
+    )
 print("🧠 Final feature dim:", FINAL_FEATURE_DIM)
 
 print("\n🎉 Done.")
