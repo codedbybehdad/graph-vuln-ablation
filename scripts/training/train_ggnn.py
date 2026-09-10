@@ -174,9 +174,12 @@ class GGNN(nn.Module):
         valid_f = F.max_pool1d(valid_f, kernel_size=2, stride=2, padding=1)
         seq = pool2(seq)
 
-        node_logits = mlp(seq.transpose(1, 2).contiguous()).squeeze(-1)
+        # Devign applies sigmoid to each branch before the pairwise
+        # multiplication. Returning probabilities here also avoids the
+        # near-zero-gradient behavior caused by multiplying two logits.
+        node_probs = torch.sigmoid(mlp(seq.transpose(1, 2).contiguous()).squeeze(-1))
         valid_f = valid_f.squeeze(1)
-        return node_logits, valid_f
+        return node_probs, valid_f
 
     def forward_tensors(self, x, edge_index, edge_type, batch):
         h = self.input_projection(x)
@@ -198,11 +201,11 @@ class GGNN(nn.Module):
         )
 
         valid_nodes = (valid_z * valid_y).to(dtype=z.dtype)
-        pairwise = z * y
+        pairwise_probs = z * y
         denom = valid_nodes.sum(dim=1).clamp_min(1.0)
-        graph_logits = (pairwise * valid_nodes).sum(dim=1) / denom
+        graph_probs = (pairwise_probs * valid_nodes).sum(dim=1) / denom
 
-        return graph_logits
+        return graph_probs.clamp(1e-6, 1.0 - 1e-6)
 
     def forward(self, x, edge_index=None, edge_type=None, batch=None):
         # Returns logits. Apply sigmoid only for evaluation/metric computation.
@@ -242,14 +245,12 @@ def evaluate(model, loader, device, threshold=None, select_threshold=False, mult
         for data in loader:
             if multi_gpu:
                 labels = torch.cat([d.y.view(-1).long() for d in data], dim=0)
-                logits = model(data)
-                probs = torch.sigmoid(logits)
+                probs = model(data)
                 labels_all.extend(labels.cpu().numpy())
                 probs_all.extend(probs.detach().cpu().numpy())
             else:
                 data = data.to(device, non_blocking=True)
-                logits = model(data.x, data.edge_index, data.edge_type, data.batch)
-                probs = torch.sigmoid(logits)
+                probs = model(data.x, data.edge_index, data.edge_type, data.batch)
                 probs_all.extend(probs.detach().cpu().numpy())
                 labels_all.extend(data.y.detach().view(-1).cpu().numpy())
 
@@ -311,22 +312,27 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler, amp_enabled
             enabled=amp_enabled,
         ):
             if multi_gpu:
-                logits = model(data)
-                loss = criterion(logits, labels.to(logits.device))
+                probs = model(data)
+                with torch.autocast(device_type="cuda", enabled=False):
+                    loss = criterion(probs.float(), labels.to(probs.device).float())
             else:
-                logits = model(data.x, data.edge_index, data.edge_type, data.batch)
-                loss = criterion(logits, labels)
+                probs = model(data.x, data.edge_index, data.edge_type, data.batch)
+                with torch.autocast(device_type="cuda", enabled=False):
+                    loss = criterion(probs.float(), labels.float())
 
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+
+        if total_loss == 0.0:
+            print(f"  first batch: loss={float(loss.detach()):.6f} grad_norm={float(grad_norm):.6f}")
 
         total_loss += float(loss.detach().cpu())
 
@@ -404,9 +410,10 @@ def train_fold(args, train_items, val_items, fold_id, device, graph_cache, multi
         # notebook compatibility; validation runs only on the master model.
         model = PyGDataParallel(base_model, device_ids=list(range(torch.cuda.device_count())))
 
-    # Train on logits so BCE remains safe under CUDA autocast.
-    # The weighted sampler balances classes without double-weighting the loss.
-    criterion = nn.BCEWithLogitsLoss()
+    # Devign's readout returns probabilities (sigmoid before pairwise
+    # multiplication). Compute BCE in FP32 outside autocast because PyTorch
+    # intentionally disallows BCELoss under CUDA autocast.
+    criterion = nn.BCELoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
