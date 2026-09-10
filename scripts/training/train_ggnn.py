@@ -1,4 +1,3 @@
-
 # TRAIN_GGNN.PY
 # Stable GGNN training for vulnerability detection.
 #
@@ -570,3 +569,9 @@ def main():
         help="all=AST+CFG+PDG; otherwise choose an individual/composite ablation",
     )
     args = parser.parse_args()
+
+    run_training(args)
+
+
+if __name__ == "__main__":
+    main()
