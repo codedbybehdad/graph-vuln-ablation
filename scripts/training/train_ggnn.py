@@ -161,7 +161,9 @@ class GGNN(nn.Module):
         # Keep the sequence dimension because Devign performs the pairwise
         # multiplication between the two learned sequences before graph-level
         # reduction.
-        seq = dense_seq.transpose(1, 2)
+        # Materialize a contiguous FP32 tensor before CUDA Conv1d.
+        # This avoids T4/CUDA misaligned-address failures after transpose.
+        seq = dense_seq.transpose(1, 2).contiguous().float()
         seq = F.relu(conv1(seq))
 
         valid_f = valid.unsqueeze(1).to(dtype=seq.dtype)
@@ -172,7 +174,7 @@ class GGNN(nn.Module):
         valid_f = F.max_pool1d(valid_f, kernel_size=2, stride=2, padding=1)
         seq = pool2(seq)
 
-        node_logits = mlp(seq.transpose(1, 2)).squeeze(-1)
+        node_logits = mlp(seq.transpose(1, 2).contiguous()).squeeze(-1)
         valid_f = valid_f.squeeze(1)
         return node_logits, valid_f
 
