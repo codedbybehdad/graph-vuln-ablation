@@ -380,8 +380,11 @@ def train_fold(args, train_items, val_items, fold_id, device, graph_cache, multi
     train_loader = make_loader(
         train_dataset, args.batch_size, True, args.workers, pin_memory, fold_seed, multi_gpu=multi_gpu
     )
+    # Keep validation on the master model/GPU. PyG DataParallel is only used
+    # for training; this avoids replica-specific CUDA issues in Conv1d during
+    # evaluation while still using every GPU for the expensive training pass.
     val_loader = make_loader(
-        val_dataset, args.batch_size, False, args.workers, pin_memory, fold_seed, multi_gpu=multi_gpu
+        val_dataset, args.batch_size, False, args.workers, pin_memory, fold_seed, multi_gpu=False
     )
 
     sample = train_dataset[0]
@@ -396,6 +399,9 @@ def train_fold(args, train_items, val_items, fold_id, device, graph_cache, multi
 
     model = base_model
     if multi_gpu:
+        # PyG DataParallel splits whole graphs across all available GPUs.
+        # It is slower than DDP, but is kept here for single-process Kaggle
+        # notebook compatibility; validation runs only on the master model.
         model = PyGDataParallel(base_model, device_ids=list(range(torch.cuda.device_count())))
 
     # Train on logits so BCE remains safe under CUDA autocast.
@@ -434,7 +440,7 @@ def train_fold(args, train_items, val_items, fold_id, device, graph_cache, multi
         )
 
         val_metrics = evaluate(
-            model, val_loader, device, select_threshold=True, multi_gpu=multi_gpu
+            base_model, val_loader, device, select_threshold=True, multi_gpu=False
         )
         scheduler.step(val_metrics["f1"])
 
@@ -470,12 +476,12 @@ def train_fold(args, train_items, val_items, fold_id, device, graph_cache, multi
 
     base_model.load_state_dict(best["state_dict"])
     final_metrics = evaluate(
-        model,
+        base_model,
         val_loader,
         device,
         threshold=best["metrics"]["threshold"],
         select_threshold=False,
-        multi_gpu=multi_gpu,
+        multi_gpu=False,
     )
 
     model_path = os.path.join(
