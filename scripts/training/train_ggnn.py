@@ -197,7 +197,7 @@ class TypedGGNN(nn.Module):
         #   log node count + log selected edge count
         pooled_dim = (
             hidden_dim * (2 + 2 * branch_count)
-            + 2 * (1 + branch_count)
+            + (1 + branch_count)
         )
 
         self.classifier = nn.Sequential(
@@ -247,6 +247,14 @@ class TypedGGNN(nn.Module):
 
         structural = torch.cat(structural_features, dim=1)
         graph_repr = torch.cat(representations + [structural], dim=1)
+
+        expected_dim = self.classifier[0].in_features
+        actual_dim = graph_repr.shape[1]
+        if actual_dim != expected_dim:
+            raise RuntimeError(
+                f"Graph representation dimension mismatch for edge mode "
+                f"'{self.edge_mode}': expected {expected_dim}, got {actual_dim}."
+            )
 
         return self.classifier(graph_repr).view(-1)
 
