@@ -15,14 +15,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Keep the original repository layout, but resolve paths relative to this file
 # so the CLI works even when it is launched from another working directory.
 LOCAL_JOERN_DIR = os.path.join(BASE_DIR, "joern", "joern-cli")
-JOERN_DATAFLOW_SCRIPT = os.path.join(BASE_DIR, "joern", "run_dataflow.sc")
-
 # Optional override for an existing Joern installation.
 # Example: export JOERN_HOME=/path/to/joern/joern-cli
 JOERN_DIR = os.environ.get("JOERN_HOME", LOCAL_JOERN_DIR)
 
 JOERN_PARSE = os.path.join(JOERN_DIR, "joern-parse")
-JOERN = os.path.join(JOERN_DIR, "joern")
 JOERN_EXPORT = os.path.join(JOERN_DIR, "joern-export")
 
 
@@ -31,10 +28,10 @@ def run_command(command_list):
         print("\n▶ Running:")
         if isinstance(command_list, str):
             print(command_list, "\n")
-            subprocess.run(command_list, shell=True, check=True)
+            subprocess.run(command_list, shell=True, check=True, cwd=BASE_DIR)
         else:
             print(" ".join(command_list), "\n")
-            subprocess.run(command_list, check=True)
+            subprocess.run(command_list, check=True, cwd=BASE_DIR)
 
         print("✅ Completed successfully.\n")
 
@@ -81,17 +78,17 @@ def train_w2v_if_needed(dataset):
 def run_joern(dataset):
     code_dir = os.path.join(BASE_DIR, "data", "intermediate", f"{dataset}_code")
 
-    missing = [p for p in (JOERN_PARSE, JOERN, JOERN_EXPORT) if not os.path.isfile(p) or not os.access(p, os.X_OK)]
+    missing = [p for p in (JOERN_PARSE, JOERN_EXPORT) if not os.path.isfile(p) or not os.access(p, os.X_OK)]
     if missing:
         print("\n❌ Joern executable(s) not found or not executable:")
         for p in missing:
             print(f"   {p}")
         print("\nPlace the Joern executables in joern/joern-cli/ or set JOERN_HOME to an existing Joern installation.")
         sys.exit(1)
-    cpg_file = "data/intermediate/devign.cpg"
+    cpg_file = os.path.join(BASE_DIR, "data", "intermediate", "devign.cpg")
 
-    graph_dir = "data/intermediate/graphs"
-    pdg_dir = "data/intermediate/pdg"
+    graph_dir = os.path.join(BASE_DIR, "data", "intermediate", "graphs")
+    pdg_dir = os.path.join(BASE_DIR, "data", "intermediate", "pdg")
 
     if not os.path.exists(code_dir):
         print(f"\n❌ Code directory not found: {code_dir}")
@@ -117,20 +114,6 @@ def run_joern(dataset):
         cpg_file
     ])
 
-    if not os.path.exists(JOERN_DATAFLOW_SCRIPT):
-        print(f"\n❌ Joern script not found: {JOERN_DATAFLOW_SCRIPT}")
-        sys.exit(1)
-
-    print("\n⚙ Running Joern data-flow analysis...\n")
-
-    run_command([
-        JOERN,
-        "--script",
-        JOERN_DATAFLOW_SCRIPT,
-        "--",
-        cpg_file
-    ])
-
     print("\n⚙ Exporting CPG graphs (AST + CFG)...\n")
 
     run_command([
@@ -153,6 +136,22 @@ def run_joern(dataset):
         cpg_file
     ])
 
+    cpg_dot_files = []
+    pdg_dot_files = []
+    for root, _, files in os.walk(graph_dir):
+        cpg_dot_files.extend(os.path.join(root, f) for f in files if f.endswith(".dot"))
+    for root, _, files in os.walk(pdg_dir):
+        pdg_dot_files.extend(os.path.join(root, f) for f in files if f.endswith(".dot"))
+
+    if not cpg_dot_files:
+        print(f"\n❌ Joern produced no CPG14 .dot files in: {graph_dir}")
+        sys.exit(1)
+    if not pdg_dot_files:
+        print(f"\n❌ Joern produced no PDG .dot files in: {pdg_dir}")
+        sys.exit(1)
+
+    print(f"\n✅ CPG14 dot files: {len(cpg_dot_files)}")
+    print(f"✅ PDG dot files: {len(pdg_dot_files)}")
     print("\n✅ Joern graph extraction finished.\n")
 
 

@@ -79,13 +79,13 @@ The Devign repository provides the original implementation and processing resour
 
 **Joern** is used to analyze the extracted C source files and generate graph representations of the programs.
 
-The pipeline first creates a Code Property Graph (CPG) using `joern-parse`, executes the project's data-flow analysis script, and then exports graph representations for:
+The pipeline first creates a Code Property Graph (CPG) using `joern-parse` and then uses `joern-export` to generate separate `cpg14` (AST + CFG) and PDG representations. The preprocessing stage merges the matching exports for each source sample and stores explicit edge-type IDs for:
 
-* Abstract Syntax Graph / AST
+* Abstract Syntax Tree / AST
 * Control Flow Graph / CFG
 * Program Dependence Graph / PDG
 
-This process is implemented directly in the project pipeline.
+The dataset builder reports extracted edge counts and aborts when any of the three required edge families is missing, preventing misleading ablation runs.
 
 ### Joern
 
