@@ -169,7 +169,7 @@ def build_dataset(dataset):
     run_command(cmd)
 
 
-def train_model(dataset, edge_types="AST,CFG"):
+def train_model(dataset, edge_types="ALL", folds=5):
 
     if isinstance(edge_types, list):
         edge_types = ",".join(edge_types)
@@ -185,6 +185,8 @@ def train_model(dataset, edge_types="AST,CFG"):
         dataset,
         "--edges",
         edges_arg,
+        "--folds",
+        str(folds),
     ]
 
     run_command(cmd)
@@ -270,9 +272,20 @@ def run_pipeline(dataset, edge_combinations=None):
 
     build_dataset(dataset)
 
-    for edges in edge_combinations:
-        print(f"\n--- Training for edge combination: {edges} ---")
-        train_model(dataset, edges)
+    # When running the complete seven-configuration experiment, call the
+    # training script once with --edges all. This guarantees that one set of
+    # reproducible 5-fold partitions is created and reused for every ablation
+    # inside the same process, and produces a combined summary JSON.
+    normalized = {normalize_edge_combo(edges) for edges in edge_combinations}
+    all_combos = {normalize_edge_combo(edges) for edges in get_all_edge_combinations()}
+
+    if normalized == all_combos:
+        print("\n--- Training all seven edge configurations with 5-fold CV ---")
+        train_model(dataset, "ALL", folds=5)
+    else:
+        for edges in edge_combinations:
+            print(f"\n--- Training for edge combination: {edges} ---")
+            train_model(dataset, edges, folds=5)
 
     print(f"\n✅ Pipeline finished for {dataset.upper()}.")
 

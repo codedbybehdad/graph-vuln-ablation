@@ -1,20 +1,20 @@
 # train_ggnn.py
-# GGNN training for vulnerability detection.
+# GGNN training for vulnerability detection with stratified K-fold CV.
 #
 # Edge modes:
-#   all, ast, cfg, pdg, ast+cfg, ast+pdg, cfg+pdg, ast+cfg+pdg
+#   ast, cfg, pdg, ast+cfg, ast+pdg, cfg+pdg, ast+cfg+pdg
 #
-# IMPORTANT:
-#   --edges all means RUN ALL SEVEN ABLATION CONFIGURATIONS:
-#       ast
-#       cfg
-#       pdg
-#       ast+cfg
-#       ast+pdg
-#       cfg+pdg
-#       ast+cfg+pdg
+# --edges all runs all seven ablation configurations.
 #
-# Any other --edges value runs exactly that one configuration.
+# Cross-validation:
+#   By default the script uses 5-fold stratified cross-validation.
+#   The SAME fold assignments are reused for every edge configuration so the
+#   ablation study compares models on identical train/validation partitions.
+#
+# Important:
+#   K-fold cross-validation changes how performance is estimated; it does not
+#   force AST+CFG+PDG to outperform the other configurations. The code below
+#   reports the measured mean and standard deviation across folds.
 
 import argparse
 import json
@@ -33,10 +33,14 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import Dataset
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GatedGraphConv, global_add_pool, global_max_pool, global_mean_pool
+from torch_geometric.nn import (
+    GatedGraphConv,
+    global_max_pool,
+    global_mean_pool,
+)
 
 
 EDGE_TYPE_MAP = {"ast": 0, "cfg": 1, "pdg": 2}
@@ -53,6 +57,19 @@ SINGLE_AND_COMBO_MODES = (
 )
 
 VALID_EDGE_MODES = ("all",) + SINGLE_AND_COMBO_MODES
+
+CORE_METRICS = (
+    "accuracy",
+    "precision",
+    "recall",
+    "f1",
+    "auc",
+)
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
 
 
 def set_seed(seed=42):
@@ -79,10 +96,17 @@ def edge_ids_for_mode(edge_mode):
     return tuple(EDGE_TYPE_MAP[token] for token in edge_mode.split("+"))
 
 
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+
 class GraphDataset(Dataset):
     def __init__(self, items, edge_mode):
         if edge_mode not in SINGLE_AND_COMBO_MODES:
-            raise ValueError(f"Training mode must be a concrete mode, got '{edge_mode}'")
+            raise ValueError(
+                f"Training mode must be a concrete mode, got '{edge_mode}'"
+            )
         self.items = items
         self.edge_mode = edge_mode
         self.selected = set(edge_ids_for_mode(edge_mode))
@@ -129,24 +153,108 @@ class GraphDataset(Dataset):
         return data
 
 
-def split_dataset(index_items):
+def make_stratified_kfold_splits(index_items, n_splits=5, seed=42):
+    """
+    Create reproducible, stratified K-fold partitions.
+
+    Every graph is used once as validation and n_splits-1 times for training.
+    The returned list is independent of edge configuration so the exact same
+    partitions are used across all ablation runs.
+    """
+    if n_splits < 2:
+        raise ValueError("n_splits must be >= 2 for K-fold cross-validation.")
+
+    if len(index_items) < n_splits:
+        raise ValueError(
+            f"Cannot create {n_splits} folds from only {len(index_items)} graphs."
+        )
+
     labels = np.asarray(
         [int(item["label"]) for item in index_items],
         dtype=np.int64,
     )
+
+    class_counts = np.bincount(labels, minlength=2)
+    if class_counts.min() < n_splits:
+        raise ValueError(
+            "Each class must contain at least n_splits samples for stratified "
+            f"{n_splits}-fold CV. Class counts: "
+            f"class 0={class_counts[0]}, class 1={class_counts[1]}"
+        )
+
     indices = np.arange(len(index_items))
 
-    train_idx, val_idx = train_test_split(
-        indices,
-        test_size=0.25,
-        stratify=labels,
-        random_state=42,
+    splitter = StratifiedKFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=seed,
     )
 
-    return (
-        [index_items[int(i)] for i in train_idx],
-        [index_items[int(i)] for i in val_idx],
+    folds = []
+
+    for fold_number, (train_idx, val_idx) in enumerate(
+        splitter.split(indices, labels),
+        start=1,
+    ):
+        train_items = [index_items[int(i)] for i in train_idx]
+        val_items = [index_items[int(i)] for i in val_idx]
+
+        train_labels = [int(item["label"]) for item in train_items]
+        val_labels = [int(item["label"]) for item in val_items]
+
+        if len(set(train_labels)) < 2 or len(set(val_labels)) < 2:
+            raise RuntimeError(
+                f"Fold {fold_number} does not contain both classes."
+            )
+
+        folds.append(
+            {
+                "fold": fold_number,
+                "train": train_items,
+                "val": val_items,
+            }
+        )
+
+    return folds
+
+
+def save_fold_assignments(items, folds, dataset, n_splits, seed):
+    """Save exact fold membership for reproducibility and auditing."""
+    os.makedirs("results", exist_ok=True)
+
+    assignments = {}
+    for fold in folds:
+        for item in fold["train"]:
+            file_id = str(item["file_id"])
+            assignments.setdefault(file_id, {})["folds_train"] = assignments.get(
+                file_id, {}
+            ).get("folds_train", []) + [fold["fold"]]
+        for item in fold["val"]:
+            file_id = str(item["file_id"])
+            assignments.setdefault(file_id, {})["validation_fold"] = fold["fold"]
+
+    output = {
+        "dataset": dataset,
+        "n_splits": int(n_splits),
+        "seed": int(seed),
+        "graphs": int(len(items)),
+        "fold_assignments": assignments,
+    }
+
+    path = os.path.join(
+        "results",
+        f"{dataset}_{n_splits}fold_split_assignments.json",
     )
+
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(output, file, indent=4)
+
+    print(f"\n🧾 Fold assignments saved to {path}")
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
 
 
 class TypedGGNN(nn.Module):
@@ -158,7 +266,8 @@ class TypedGGNN(nn.Module):
         CFG edges -> CFG GGNN
         branch representations -> graph classifier
 
-    The all-three configuration therefore uses three independent typed branches.
+    The all-three configuration therefore uses three independent typed
+    branches, followed by the same classifier design used by the ablations.
     """
 
     def __init__(self, in_channels, edge_mode, hidden_dim=128, steps=2):
@@ -187,14 +296,6 @@ class TypedGGNN(nn.Module):
 
         branch_count = len(self.edge_ids)
 
-        # Per branch:
-        #   mean pool + max pool
-        #
-        # Shared:
-        #   initial mean + initial max
-        #
-        # Structural:
-        #   log node count + log selected edge count
         pooled_dim = (
             hidden_dim * (2 + 2 * branch_count)
             + (1 + branch_count)
@@ -219,9 +320,10 @@ class TypedGGNN(nn.Module):
             global_max_pool(x0, batch),
         ]
 
-        # Graph size is an explicit structural feature. It is log-scaled
-        # and normalized so very large graphs do not dominate the classifier.
-        node_counts = torch.bincount(batch, minlength=int(batch.max().item()) + 1)
+        node_counts = torch.bincount(
+            batch,
+            minlength=int(batch.max().item()) + 1,
+        )
         structural_features = [
             torch.log1p(node_counts.float()).unsqueeze(1)
         ]
@@ -241,12 +343,13 @@ class TypedGGNN(nn.Module):
                 minlength=node_counts.numel(),
             ).float()
 
-            # The above count is per source node occurrence. Log scaling keeps
-            # the structural feature stable across graph sizes.
             structural_features.append(torch.log1p(edge_counts).unsqueeze(1))
 
         structural = torch.cat(structural_features, dim=1)
-        graph_repr = torch.cat(representations + [structural], dim=1)
+        graph_repr = torch.cat(
+            representations + [structural],
+            dim=1,
+        )
 
         expected_dim = self.classifier[0].in_features
         actual_dim = graph_repr.shape[1]
@@ -257,6 +360,11 @@ class TypedGGNN(nn.Module):
             )
 
         return self.classifier(graph_repr).view(-1)
+
+
+# ---------------------------------------------------------------------------
+# Metrics / training
+# ---------------------------------------------------------------------------
 
 
 def evaluate(model, loader, device, threshold=0.5, select_threshold=False):
@@ -427,7 +535,15 @@ def report_dataset(items, edge_mode):
         )
 
 
-def run_single_training(args, train_items, val_items, edge_mode, device):
+def run_single_training(
+    args,
+    train_items,
+    val_items,
+    edge_mode,
+    device,
+    fold_number,
+):
+    """Train one edge configuration on one CV fold."""
     train_dataset = GraphDataset(train_items, edge_mode)
     val_dataset = GraphDataset(val_items, edge_mode)
 
@@ -444,7 +560,6 @@ def run_single_training(args, train_items, val_items, edge_mode, device):
     )
 
     sample = train_dataset[0]
-
     in_channels = int(sample.x.shape[1])
 
     model = TypedGGNN(
@@ -452,8 +567,6 @@ def run_single_training(args, train_items, val_items, edge_mode, device):
         edge_mode=edge_mode,
     ).to(device)
 
-    # FFmpeg is effectively balanced. Use ordinary BCE instead of forcing
-    # the optimizer toward either class.
     criterion = nn.BCEWithLogitsLoss()
 
     optimizer = torch.optim.AdamW(
@@ -474,20 +587,21 @@ def run_single_training(args, train_items, val_items, edge_mode, device):
     os.makedirs("results", exist_ok=True)
 
     safe_mode = edge_mode.replace("+", "_")
+    run_tag = f"{args.dataset}_{safe_mode}_fold{fold_number}"
 
     model_path = os.path.join(
         "models",
-        f"best_model_{args.dataset}_{safe_mode}.pt",
+        f"best_model_{run_tag}.pt",
     )
 
     result_path = os.path.join(
         "results",
-        f"{args.dataset}_{safe_mode}_metrics.json",
+        f"{run_tag}_metrics.json",
     )
 
     plot_path = os.path.join(
         "results",
-        f"{args.dataset}_{safe_mode}_training_curve.png",
+        f"{run_tag}_training_curve.png",
     )
 
     best_auc = -float("inf")
@@ -528,7 +642,7 @@ def run_single_training(args, train_items, val_items, edge_mode, device):
 
         lr = optimizer.param_groups[0]["lr"]
 
-        print(f"\nEpoch {epoch + 1}/{args.epochs}")
+        print(f"\nFold {fold_number} | Epoch {epoch + 1}/{args.epochs}")
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Val Accuracy: {val_metrics['accuracy']:.4f}")
         print(f"Val Precision: {val_metrics['precision']:.4f}")
@@ -583,10 +697,11 @@ def run_single_training(args, train_items, val_items, edge_mode, device):
 
     if best_epoch == 0:
         raise RuntimeError(
-            f"No model checkpoint was saved for edge mode '{edge_mode}'."
+            f"No model checkpoint was saved for edge mode '{edge_mode}', "
+            f"fold {fold_number}."
         )
 
-    print("\n📥 Loading best model...")
+    print(f"\n📥 Loading best model for fold {fold_number}...")
 
     model.load_state_dict(
         torch.load(
@@ -608,21 +723,22 @@ def run_single_training(args, train_items, val_items, edge_mode, device):
         {
             "dataset": args.dataset,
             "edges": edge_mode,
-            "evaluation_split": "validation",
-            "split_ratio": "75% train / 25% validation",
+            "evaluation_split": f"fold_{fold_number}_validation",
+            "cross_validation": "StratifiedKFold",
+            "n_folds": int(args.folds),
+            "fold": int(fold_number),
+            "fold_train_size": int(len(train_items)),
+            "fold_validation_size": int(len(val_items)),
+            "split_ratio": "80% train / 20% validation per fold",
             "selection_metric": (
                 "validation AUC "
                 "(F1, then accuracy tie-breakers)"
             ),
             "selected_checkpoint_epoch": int(best_epoch),
-            "selected_checkpoint_accuracy": float(
-                best_accuracy
-            ),
+            "selected_checkpoint_accuracy": float(best_accuracy),
             "selected_checkpoint_f1": float(best_f1),
             "selected_checkpoint_auc": float(best_auc),
-            "selected_checkpoint_threshold": float(
-                best_threshold
-            ),
+            "selected_checkpoint_threshold": float(best_threshold),
             "highest_validation_accuracy": float(
                 max(val_accuracies)
             ),
@@ -635,7 +751,7 @@ def run_single_training(args, train_items, val_items, edge_mode, device):
         }
     )
 
-    print("\n✅ FINAL VALIDATION RESULTS\n")
+    print("\n✅ FINAL FOLD VALIDATION RESULTS\n")
     print(json.dumps(final_metrics, indent=4))
 
     with open(
@@ -661,26 +777,104 @@ def run_single_training(args, train_items, val_items, edge_mode, device):
     plt.xlabel("Epoch")
     plt.ylabel("Metric")
     plt.title(
-        f"{args.dataset.upper()} - {edge_mode}"
+        f"{args.dataset.upper()} - {edge_mode} - Fold {fold_number}"
     )
     plt.tight_layout()
     plt.savefig(plot_path)
     plt.close()
 
-    print(f"\n📁 Results saved to {result_path}")
-    print(f"📈 Training curve saved to {plot_path}")
+    print(f"\n📁 Fold results saved to {result_path}")
+    print(f"📈 Fold training curve saved to {plot_path}")
 
     return final_metrics
 
 
+def aggregate_fold_results(fold_results, args, edge_mode):
+    """Compute mean/std across the K held-out validation folds."""
+    if len(fold_results) != args.folds:
+        raise RuntimeError(
+            f"Expected {args.folds} fold results for '{edge_mode}', "
+            f"received {len(fold_results)}."
+        )
+
+    means = {}
+    stds = {}
+
+    for metric in CORE_METRICS:
+        values = np.asarray(
+            [float(result[metric]) for result in fold_results],
+            dtype=np.float64,
+        )
+        means[metric] = float(values.mean())
+        stds[metric] = float(values.std(ddof=1))
+
+    threshold_values = np.asarray(
+        [float(result["threshold"]) for result in fold_results],
+        dtype=np.float64,
+    )
+    epoch_values = np.asarray(
+        [float(result["selected_checkpoint_epoch"]) for result in fold_results],
+        dtype=np.float64,
+    )
+
+    aggregate = {
+        "dataset": args.dataset,
+        "edges": edge_mode,
+        "cross_validation": "StratifiedKFold",
+        "n_folds": int(args.folds),
+        "seed": int(args.seed),
+        "evaluation_protocol": (
+            f"{args.folds}-fold stratified cross-validation; "
+            "each fold is used once as validation"
+        ),
+        "fold_results": fold_results,
+        "mean": means,
+        "std": stds,
+        "threshold_mean": float(threshold_values.mean()),
+        "threshold_std": float(threshold_values.std(ddof=1)),
+        "selected_epoch_mean": float(epoch_values.mean()),
+        "selected_epoch_std": float(epoch_values.std(ddof=1)),
+    }
+
+    safe_mode = edge_mode.replace("+", "_")
+    path = os.path.join(
+        "results",
+        f"{args.dataset}_{safe_mode}_{args.folds}fold_metrics.json",
+    )
+
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(aggregate, file, indent=4)
+
+    print(f"\n📊 {args.folds}-FOLD SUMMARY: {edge_mode}")
+    for metric in CORE_METRICS:
+        print(
+            f"   {metric.upper():9s}: "
+            f"{means[metric]:.4f} ± {stds[metric]:.4f}"
+        )
+    print(f"   THRESHOLD : {aggregate['threshold_mean']:.3f} ± {aggregate['threshold_std']:.3f}")
+    print(f"   EPOCH     : {aggregate['selected_epoch_mean']:.1f} ± {aggregate['selected_epoch_std']:.1f}")
+    print(f"\n📁 CV summary saved to {path}")
+
+    return aggregate
+
+
+# ---------------------------------------------------------------------------
+# Experiment runner
+# ---------------------------------------------------------------------------
+
+
 def run_experiments(args):
-    set_seed(42)
+    set_seed(args.seed)
 
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
 
     print("\n🚀 Device:", device)
+    print(
+        f"🔁 Cross-validation: {args.folds}-fold stratified CV "
+        f"(seed={args.seed})"
+    )
 
     dataset_index_path = os.path.join(
         "data",
@@ -705,27 +899,42 @@ def run_experiments(args):
             "Dataset index contains no graphs."
         )
 
-    train_items, val_items = split_dataset(items)
+    modes = expand_edge_modes(args.edges)
 
     print(
         f"📦 Graphs: {len(items)} total | "
-        f"{len(train_items)} train | "
-        f"{len(val_items)} validation"
+        f"{args.folds} folds | "
+        f"~{100 * (args.folds - 1) / args.folds:.1f}% train / "
+        f"~{100 / args.folds:.1f}% validation per fold"
     )
 
-    train_labels = [int(x["label"]) for x in train_items]
-    val_labels = [int(x["label"]) for x in val_items]
-
+    labels = np.asarray(
+        [int(item["label"]) for item in items],
+        dtype=np.int64,
+    )
+    unique, counts = np.unique(labels, return_counts=True)
+    label_counts = dict(zip(unique.tolist(), counts.tolist()))
     print(
-        f"📊 Train labels: class 0={train_labels.count(0)}, "
-        f"class 1={train_labels.count(1)}"
-    )
-    print(
-        f"📊 Val labels:   class 0={val_labels.count(0)}, "
-        f"class 1={val_labels.count(1)}"
+        "📊 Full dataset labels: "
+        + ", ".join(
+            f"class {label}={count}" for label, count in label_counts.items()
+        )
     )
 
-    modes = expand_edge_modes(args.edges)
+    # Create folds ONCE and reuse them for every edge configuration.
+    folds = make_stratified_kfold_splits(
+        items,
+        n_splits=args.folds,
+        seed=args.seed,
+    )
+
+    save_fold_assignments(
+        items,
+        folds,
+        args.dataset,
+        args.folds,
+        args.seed,
+    )
 
     print(
         "\n🧪 Configurations to run:",
@@ -734,34 +943,79 @@ def run_experiments(args):
 
     results = {}
 
+    # Report edge availability once over the full dataset.
+    for edge_mode in modes:
+        report_dataset(items, edge_mode)
+
+    # IMPORTANT: each edge mode gets the same fold partitions.
     for run_number, edge_mode in enumerate(modes, start=1):
         print(
             "\n"
             + "=" * 72
-            + f"\nRUN {run_number}/{len(modes)}: {edge_mode}\n"
+            + f"\nRUN {run_number}/{len(modes)}: {edge_mode}"
+            + "\n"
             + "=" * 72
         )
 
-        # Fresh deterministic initialization per ablation.
-        set_seed(42)
+        fold_results = []
 
-        report_dataset(items, edge_mode)
+        for fold in folds:
+            fold_number = fold["fold"]
 
-        results[edge_mode] = run_single_training(
+            print(
+                "\n"
+                + "-" * 72
+                + f"\n{edge_mode.upper()} | FOLD {fold_number}/{args.folds}"
+                + "\n"
+                + "-" * 72
+            )
+
+            train_items = fold["train"]
+            val_items = fold["val"]
+
+            train_labels = [int(x["label"]) for x in train_items]
+            val_labels = [int(x["label"]) for x in val_items]
+
+            print(
+                f"📚 Train: {len(train_items)} graphs | "
+                f"class 0={train_labels.count(0)}, "
+                f"class 1={train_labels.count(1)}"
+            )
+            print(
+                f"🧪 Val:   {len(val_items)} graphs | "
+                f"class 0={val_labels.count(0)}, "
+                f"class 1={val_labels.count(1)}"
+            )
+
+            # Use the same fold-specific seed for every edge mode so that the
+            # random initialization/shuffling is comparable within a fold.
+            fold_seed = args.seed + fold_number
+            set_seed(fold_seed)
+
+            fold_result = run_single_training(
+                args,
+                train_items,
+                val_items,
+                edge_mode,
+                device,
+                fold_number,
+            )
+
+            fold_results.append(fold_result)
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        results[edge_mode] = aggregate_fold_results(
+            fold_results,
             args,
-            train_items,
-            val_items,
             edge_mode,
-            device,
         )
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     if len(results) > 1:
         combined_path = os.path.join(
             "results",
-            f"{args.dataset}_all_ablation_metrics.json",
+            f"{args.dataset}_all_ablation_{args.folds}fold_metrics.json",
         )
 
         with open(
@@ -776,8 +1030,22 @@ def run_experiments(args):
             )
 
         print(
-            f"\n📊 All ablation results saved to {combined_path}"
+            f"\n📊 All {len(results)} ablation summaries saved to {combined_path}"
         )
+
+        print("\n================ CROSS-VALIDATED ABLATION SUMMARY ================")
+        for edge_mode, summary in results.items():
+            print(
+                f"{edge_mode:15s} | "
+                f"ACC {summary['mean']['accuracy']:.4f} ± {summary['std']['accuracy']:.4f} | "
+                f"F1 {summary['mean']['f1']:.4f} ± {summary['std']['f1']:.4f} | "
+                f"AUC {summary['mean']['auc']:.4f} ± {summary['std']['auc']:.4f}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 
 def main():
@@ -814,6 +1082,20 @@ def main():
     )
 
     parser.add_argument(
+        "--folds",
+        type=int,
+        default=5,
+        help="Number of stratified CV folds (default: 5).",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed used to create the shared CV folds (default: 42).",
+    )
+
+    parser.add_argument(
         "--edges",
         type=str,
         default="all",
@@ -825,6 +1107,10 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.folds < 2:
+        parser.error("--folds must be >= 2.")
+
     run_experiments(args)
 
 

@@ -494,6 +494,32 @@ python scripts/training/train_ggnn.py --dataset qemu --edges ast+cfg+pdg
 
 The same commands can be used for FFmpeg by replacing `qemu` with `ffmpeg`.
 
+### 5-fold cross-validation
+
+The training script now uses **stratified 5-fold cross-validation by default**. Each fold uses approximately 80% of the graphs for training and 20% for validation; every graph is used as validation exactly once. The same fold assignments are reused for all seven edge configurations so the ablation comparison is paired and reproducible.
+
+Run all seven configurations in one call:
+
+```bash
+python scripts/training/train_ggnn.py --dataset qemu --edges all --folds 5
+```
+
+Run the complete experiment for both datasets:
+
+```bash
+python main.py --full-experiment
+```
+
+The training script writes one metrics file per fold and a cross-validated summary containing the **mean ± standard deviation** for Accuracy, Precision, Recall, F1, and AUC. It also stores the exact fold assignments in `results/<dataset>_5fold_split_assignments.json`.
+
+For a single configuration, for example the full three-edge graph:
+
+```bash
+python scripts/training/train_ggnn.py --dataset qemu --edges ast+cfg+pdg --folds 5
+```
+
+K-fold validation is an evaluation protocol; it does not force a particular edge configuration to win. If the all-edge configuration is genuinely stronger, the cross-validated mean should reflect that more reliably than a single 75/25 split.
+
 ---
 
 ## Running the Complete Experiment
